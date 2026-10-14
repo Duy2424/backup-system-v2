@@ -181,9 +181,11 @@ ID là HMAC có khoá nên không lộ nội dung; offset/độ dài từng blob
   "chunker": { "algorithm": "fastcdc-1.7.0", "min_size": 524288, "avg_size": 1048576, "max_size": 8388608 },
   "stats": {
     "files": 5321, "dirs": 87, "bytes": 524288000,
+    "files_cached": 5060, "files_read": 261, "bytes_read": 230686720,
     "chunks": 812, "chunks_new": 41, "bytes_new": 39845888,
     "packs_new": 3, "bytes_uploaded": 31457280, "seconds": 18.4
   },
+  "errors": [ { "path": "C:\\Users\\duy\\pagefile.sys", "error": "PermissionError ..." } ],
   "tree": [
     { "path": "du_lieu/tai_lieu", "type": "dir", "mtime_ns": 1767225600000000000, "attrs": 16 },
     { "path": "du_lieu/tai_lieu/Báo cáo tháng 01.docx", "type": "file",
@@ -372,6 +374,19 @@ bao giờ trả dữ liệu sai.
   Đề xuất: dọn chạy **cục bộ trên PC** bằng tài khoản quản trị riêng (không phải tài khoản chạy API),
   trong khung giờ bảo trì; API vẫn không có lệnh xoá. **[CẦN B CHỐT]**
 - Bản sao lên cloud Object Lock (tuần 5, B): rclone đồng bộ nguyên thư mục kho; định dạng không đổi.
+
+## 13b. Cài đặt tham chiếu (A, tuần 2)
+
+Định dạng trên đã được hiện thực và kiểm thử trong `core/` (81 test pytest):
+
+| Phần | Module | B dùng lại được |
+|---|---|---|
+| Kiểm tra pack không cần khoá (§6.3) | `core.packer.parse_structure()`, `parse_footer()` | **Có** — server gọi khi nhận `PUT /packs` |
+| Đọc bảng ID để dựng index chunk → pack | `core.repo_local.LocalRepo._ids_of_pack()` | Có |
+| Ghi tạm → hard link (không ghi đè) → xoá tạm | `core.repo_local.LocalRepo._write_once()` | Có |
+| Toàn bộ bố cục thư mục kho (§9) | `core.repo_local.LocalRepo` | Có thể làm phần lưu trữ của API kho |
+
+Ví dụ thật (kho tạo bằng `python -m core init`): `config`, `keys\<64 hex>`, `packs\3f\3f9a…`, `snapshots\<64 hex>`.
 
 ## 14. Việc B cần xác nhận
 

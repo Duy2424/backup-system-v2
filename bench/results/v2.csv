@@ -1,0 +1,5 @@
+﻿thoi_gian,phien_ban,lan_chay,giay,byte_doc,byte_gui,dung_luong_kho,may,kich_thuoc_du_lieu,so_file,mo_ta,ghi_chu
+2026-10-14T14:26:10+07:00,v2,1,6.793,517508784,339157536,339158482,Duy2424,517508784,5229,full,seed=2026 size=500MB digest0=f0040b2508fa kho=local chunks_new=5518/5518 packs_new=21 files_read=5229/5229 snapshot=afb78ff56468
+2026-10-14T14:26:38+07:00,v2,2,3.921,241937198,36225376,375383858,Duy2424,524491115,5229,mutate 5% vong 1,seed=2026 size=500MB digest0=f0040b2508fa kho=local chunks_new=291/5516 packs_new=3 files_read=262/5229 snapshot=e5d850c35e1b
+2026-10-14T14:26:47+07:00,v2,3,4.033,235878063,38235018,413618876,Duy2424,537516517,5229,mutate 5% vong 2,seed=2026 size=500MB digest0=f0040b2508fa kho=local chunks_new=293/5525 packs_new=3 files_read=262/5229 snapshot=807219c52bd4
+2026-10-14T14:28:02+07:00,v2,3,15.844,429987864,0,413618876,Duy2424,537516517,5229,khôi phục lần 3,seed=2026 size=500MB digest0=f0040b2508fa kho=local restore packs_read=28 bytes_from_repo=428921660 digest=khop

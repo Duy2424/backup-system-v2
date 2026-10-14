@@ -51,5 +51,17 @@ v1, v2, restic chạy trên cùng dữ liệu.
 Windows, gồm cả file tạm tar.gz/.bkup của v1); `byte_gui` = tổng `Content-Length` các request gửi lên server;
 `dung_luong_kho` = dung lượng thư mục kho sau lần chạy.
 
+## 3. Đo v2 — `bench_v2.py`
+
+```powershell
+.venv\Scripts\python.exe bench\bench_v2.py
+```
+
+- Cùng bộ dữ liệu, cùng chuỗi full → mutate 5% → mutate 5% như `bench_v1.py`, kho v2 **local** (`core.repo_local`).
+- `byte_gui` = tổng byte pack mới + snapshot, tức đúng lượng sẽ gửi qua mạng ở tuần 3.
+- Sau lần cuối: khôi phục snapshot ra thư mục mới và so `digest` với dữ liệu nguồn (dừng nếu khác).
+  Dòng `mo_ta = "khôi phục lần 3"` trong CSV ghi thời gian khôi phục.
+- Ghi `bench\results\v2.csv`, rồi in bảng so với các dòng cùng seed + size trong `v1.csv`.
+
 **Lưu ý khi đo để đưa vào báo cáo:** đóng bớt ứng dụng nặng, cắm sạc, không chạy việc khác cùng lúc.
 Dữ liệu vừa sinh nằm sẵn trong cache RAM của Windows (cache nóng), điều kiện này giống nhau cho v1 và v2.

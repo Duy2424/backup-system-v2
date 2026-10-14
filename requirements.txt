@@ -16,4 +16,6 @@ cryptography==42.0.5
 zstandard==0.23.0
 
 # ----- v2 (DACN) / kiem thu -----
+# fastcdc - cat mau theo noi dung (FastCDC, ban Cython). PIN DUNG: ranh gioi mau phu thuoc cai dat.
+fastcdc==1.7.0
 pytest==8.3.3

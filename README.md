@@ -80,12 +80,39 @@ Cả hai vẫn gửi lại toàn bộ mỗi lần (~324 MB) — giảm phần n�
 Tương thích: file `.bkup` cũ (CBC + gzip) vẫn khôi phục được; CSDL cũ tự nâng cấp khi server khởi động.
 Nếu dùng lại CSDL cũ, tài khoản mặc định `admin/admin123`, `user1/user123` vẫn còn — **đổi mật khẩu ngay**.
 
+## v2 — lõi chia mẩu + khử trùng lặp (`core/`, đang phát triển)
+
+File được cắt thành mẩu theo nội dung (FastCDC 512 KiB / 1 MiB / 8 MiB). Mỗi mẩu có ID = HMAC-SHA256 dùng khoá riêng,
+được nén zstd rồi mã hoá AES-256-GCM, sau đó gom thành pack ~16 MiB. Lần sau chỉ gửi những mẩu kho chưa có.
+Khoá chủ nằm phía client, được bọc bằng mật khẩu (scrypt); kho chỉ thấy ID và kích thước. Định dạng: [`docs/repo-format.md`](docs/repo-format.md).
+
+```bat
+set BACKUP_V2_PASSWORD=...                      rem hoặc --password-file, hoặc nhập khi được hỏi
+.venv\Scripts\python -m core init      --repo D:\kho-v2
+.venv\Scripts\python -m core backup    --repo D:\kho-v2 D:\DuLieu C:\inetpub
+.venv\Scripts\python -m core snapshots --repo D:\kho-v2
+.venv\Scripts\python -m core restore   --repo D:\kho-v2 latest --target E:\KhoiPhuc [--include DuLieu/van_ban]
+.venv\Scripts\python -m core check     --repo D:\kho-v2
+```
+
+Đo trên cùng bộ dữ liệu 500 MB (laptop, kho local; `bench/results/v1.csv`, `v2.csv`):
+
+| Lần | v1 gốc: giây / gửi / kho | v1 tối ưu: giây / gửi / kho | **v2: giây / gửi / kho** |
+|---|---|---|---|
+| full | 53,9 s / 324 MiB / 324 MiB | 7,5 s / 323 MiB / 323 MiB | **6,8 s / 323 MiB / 323 MiB** |
+| sau 5% thay đổi | 62,2 s / 326 MiB / 650 MiB | 9,2 s / 324 MiB / 647 MiB | **3,9 s / 34,5 MiB / 358 MiB** |
+| sau 5% nữa | 71,4 s / 336 MiB / 986 MiB | 21,0 s / 335 MiB / 983 MiB | **4,0 s / 36,5 MiB / 395 MiB** |
+
+Khôi phục bản cuối (5.229 file) mất 15,8 s, digest khớp 100% với dữ liệu nguồn.
+
 ## Kiểm thử và đo đạc
 
 ```bat
 .venv\Scripts\python -m pytest -q
 .venv\Scripts\python bench\bench_v1.py                 rem đo bản hiện tại (500 MB, 3 lần)
 .venv\Scripts\python bench\bench_v1.py --ref v1-goc    rem đo bản đồ án cơ sở gốc
+.venv\Scripts\python bench\bench_v2.py                 rem đo v2 + khôi phục kiểm chứng + bảng so sánh
+.venv\Scripts\python -m pytest -s tests\test_core_required.py   rem 6 test bắt buộc của v2, in số mẩu mới/tổng
 ```
 
 Chi tiết: [`bench/README.md`](bench/README.md). Thử VSS trên PC: [`docs/vss-test.md`](docs/vss-test.md).
@@ -99,6 +126,7 @@ backup-system/
 ├── agent/             agent.py (vòng poll), backup_logic.py, restore_logic.py, system_state.py,
 │                      network_advanced.py, sql_registry.py, folder_browser.py, remote_storage.py, winexec.py
 ├── shared/            config.py, database.py, encryption_utils.py, snapshot.py, log.py, text.py
+├── core/              v2: scanner, chunker, crypto, packer, repo_local, repository, cli (python -m core)
 ├── bench/             make_dataset.py, bench_v1.py, results/*.csv
 ├── tests/             pytest
 ├── docs/              repo-format.md (hợp đồng kho v2), vss-test.md, PRODUCT.md, lich-su/
@@ -109,7 +137,8 @@ backup-system/
 
 ## Hạn chế và hướng phát triển
 
-- Mỗi lần vẫn là bản đầy đủ → v2: chia mẩu FastCDC, chỉ gửi mẩu mới, khoá mã hoá giữ ở client.
+- Bản 1.5 mỗi lần vẫn là bản đầy đủ → lõi v2 (`core/`) đã chạy local; tuần 3 nối qua mạng (API kho của B + mTLS)
+  và thay thế đường backup của agent.
 - Kho nằm trên chính PC → tuần 5: bản sao bất biến (Object Lock) lên cloud.
 - Server dùng HTTP trong Tailscale (đã mã hoá bởi WireGuard) → tuần 3: Caddy mTLS.
 
