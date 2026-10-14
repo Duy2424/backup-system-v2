@@ -105,6 +105,11 @@ set BACKUP_V2_PASSWORD=...                      rem hoặc --password-file, ho�
 
 Khôi phục bản cuối (5.229 file) mất 15,8 s, digest khớp 100% với dữ liệu nguồn.
 
+Qua mạng (tuần 3): `--repo https://<IP Tailscale của PC>:<cổng>` cùng `--cert/--key/--ca` (mTLS), `--limit 2MB/s`
+hoặc `--limit-schedule config\gioi_han_toc_do.json`. Đứt mạng giữa chừng thì client tự thử lại; chạy lại sẽ chỉ gửi
+các mẩu còn thiếu. Checklist chạy thật: [`docs/tuan3-chay-that.md`](docs/tuan3-chay-that.md).
+SQL Server: [`scripts/sql/`](scripts/sql/) (Full hàng tuần / Diff hàng ngày / Log 15 phút, CHECKSUM, 3 Scheduled Task).
+
 ## Kiểm thử và đo đạc
 
 ```bat

@@ -1,0 +1,7 @@
+{
+  "_ghi_chu": "Giờ hành chính thứ 2-6 giới hạn 2 MB/s để không chiếm mạng văn phòng; ngoài giờ và cuối tuần không giới hạn. thu: 2=Thứ Hai ... 7=Thứ Bảy, 8=Chủ Nhật.",
+  "mac_dinh": null,
+  "khung_gio": [
+    {"thu": [2, 3, 4, 5, 6], "tu": "08:00", "den": "17:30", "toc_do": "2MB/s"}
+  ]
+}

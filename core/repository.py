@@ -16,6 +16,7 @@ ten (khong bao gio de lai file ghi do dang mang ten that), tra lai mtime + thuoc
 import getpass
 import hashlib
 import json
+import logging
 import os
 import platform
 import secrets
@@ -32,6 +33,7 @@ from core.errors import Cancelled, IntegrityError, NotFound, RepoError, WrongPas
 from core.scanner import FileCache, make_matcher, scan
 from shared.snapshot import long_path, root_names
 
+log = logging.getLogger("core")
 CONFIG_FORMAT = "backup-system-v2"
 SNAP_HEADER = b"BSV2SN\x01\x00"
 QUERY_BATCH = 1000
@@ -207,10 +209,12 @@ class Repository:
 
         def upload_pack():
             nonlocal writer
-            pid, data, _ = writer.finish()
+            pid, data, ents = writer.finish()
             self.backend.put_pack(pid, data)
             st["packs_new"] += 1
             st["bytes_uploaded"] += len(data)
+            log.info("Gửi pack %s: %d mẩu, %s byte (tổng đã gửi %s byte)", pid[:12], len(ents),
+                     f"{len(data):,}", f"{st['bytes_uploaded']:,}")
             writer = packer.PackWriter(self.keys, self.pack_target)
 
         def flush():
@@ -295,6 +299,8 @@ class Repository:
         }
         sid, snap_size = self.save_snapshot(snap)          # luon la buoc CUOI
         st["bytes_uploaded"] += snap_size
+        log.info("Ghi snapshot %s (%d file, mẩu mới %d/%d, %d pack mới)", sid[:12], st["files"],
+                 st["chunks_new"], st["chunks"], st["packs_new"])
         st["seconds"] = round(time.perf_counter() - t0, 3)
         prog.final("xong")
         return {"snapshot_id": sid, "parent": parent_id, "stats": st, "errors": errors}
@@ -374,7 +380,19 @@ class Repository:
     def check(self, read_data=True, progress=None):
         """Kiem tra toan bo kho. Tra ve {"packs","chunks","snapshots","errors":[...]}."""
         errors, index = [], {}
-        packs = self.backend.list_packs()
+        try:
+            packs = self.backend.list_packs()
+        except NotImplementedError:
+            # API kho khong liet ke pack: kiem tra cac pack ma snapshot tham chieu
+            ids = set()
+            for s in self.backend.list_snapshots():
+                try:
+                    ids.update(h for e in self.load_snapshot(s["id"])["tree"] for h in e.get("chunks", ()))
+                except (IntegrityError, RepoError, ValueError):
+                    pass
+            ids = sorted(ids)
+            packs = sorted({p for i in range(0, len(ids), LOCATE_BATCH)
+                            for p in self.backend.locate_chunks(ids[i:i + LOCATE_BATCH]).values()})
         for n, pid in enumerate(packs, 1):
             try:
                 for e in packer.verify_pack(self.backend.get_pack(pid), pid, self.keys, read_data):

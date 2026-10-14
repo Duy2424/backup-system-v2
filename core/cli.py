@@ -45,7 +45,25 @@ def _password(args, confirm=False):
 
 
 def _backend(args):
+    if args.repo.startswith(("http://", "https://")):
+        from core.repo_http import HttpRepo
+        from core.ratelimit import RateLimiter, Schedule
+        limiter = None
+        if getattr(args, "limit_schedule", None):
+            limiter = RateLimiter(Schedule.load(args.limit_schedule))
+        elif getattr(args, "limit", None):
+            limiter = RateLimiter(rate=args.limit)
+        return HttpRepo(args.repo, cert=args.cert, key=args.key, ca=args.ca, limiter=limiter)
     return LocalRepo(args.repo)
+
+
+def _logging(args):
+    import logging
+    handlers = [logging.StreamHandler(sys.stderr)]
+    if getattr(args, "log_file", None):
+        handlers.append(logging.FileHandler(args.log_file, encoding="utf-8"))
+    logging.basicConfig(level=logging.INFO if args.verbose or args.log_file else logging.WARNING,
+                        format="%(asctime)s %(levelname)-7s %(message)s", handlers=handlers)
 
 
 def _progress(done, total, msg):
@@ -129,8 +147,15 @@ def main(argv=None):
     _console()
     ap = argparse.ArgumentParser(prog="python -m core", description="Backup v2: chia mẩu + khử trùng lặp + AES-GCM")
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--repo", required=True, help="thư mục kho")
+    common.add_argument("--repo", required=True, help="thư mục kho, hoặc https://<IP Tailscale PC>:<cổng> (API kho)")
     common.add_argument("--password-file", help="file chứa mật khẩu (dòng đầu)")
+    common.add_argument("--cert", help="chứng chỉ client (mTLS) .pem")
+    common.add_argument("--key", help="khoá riêng của chứng chỉ client .pem")
+    common.add_argument("--ca", help="CA để xác minh server .pem")
+    common.add_argument("--limit", help="giới hạn tốc độ gửi cố định, vd 2MB/s")
+    common.add_argument("--limit-schedule", help="file JSON lịch giới hạn tốc độ (xem core/ratelimit.py)")
+    common.add_argument("--log-file", help="ghi log tiến độ ra file")
+    common.add_argument("-v", "--verbose", action="store_true", help="in log tiến độ")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("init", parents=[common], help="tạo kho mới")
@@ -166,6 +191,7 @@ def main(argv=None):
     p.set_defaults(fn=cmd_check)
 
     args = ap.parse_args(argv)
+    _logging(args)
     try:
         return args.fn(args) or 0
     except WrongPassword as e:
