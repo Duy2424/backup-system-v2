@@ -96,6 +96,18 @@ powershell -ExecutionPolicy Bypass -File scripts\sql\register_tasks.ps1 -Databas
 - [ ] Đưa `D:\SQLBackup` vào backup v2: `python -m core backup --repo ... D:\SQLBackup`.
 - [ ] Chụp màn hình Task Scheduler + thư mục backup.
 
+## 9. Khôi phục CSDL về một thời điểm (tuần 4, diễn tập K3)
+
+1. Ghi lại giờ hiện tại `T`, sau đó **xoá nhầm** vài dòng: `DELETE FROM dbo.DonHang WHERE ...`
+2. Chờ task Log chạy thêm một lần (hoặc chạy tay `\BackupSystem\BackupSQL-Log`).
+3. Xem kế hoạch, rồi khôi phục ra CSDL mới để đối chiếu:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File scripts\sql\restore_pitr.ps1 -Database ShopDB -StopAt "<T>" -PrintOnly
+   powershell -ExecutionPolicy Bypass -File scripts\sql\restore_pitr.ps1 -Database ShopDB -StopAt "<T>"
+   ```
+4. `ShopDB_khoiphuc` phải còn đủ các dòng đã xoá. Chụp màn hình trước/sau, ghi lại thời gian khôi phục.
+   Nếu muốn ghi đè CSDL gốc: thêm `-TargetDatabase ShopDB -Replace` (chỉ làm sau khi đã đối chiếu xong).
+
 ## Cần thống nhất với B trước khi chạy
 
 - [ ] Đường dẫn gốc API (`BASE`) và cổng Caddy, ví dụ `https://100.x.y.z:8443`.
