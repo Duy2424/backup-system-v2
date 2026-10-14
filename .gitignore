@@ -58,3 +58,9 @@ secret_key.txt
 # ===== Config local =====
 agent_config.local.txt
 config.local.py
+
+# ===== v2: benchmark / test =====
+# Bo du lieu mau va thu muc lam viec cua bench (sinh lai duoc tu seed)
+bench/data/
+bench/work/
+.pytest_cache/

@@ -1,0 +1,4 @@
+﻿thoi_gian,phien_ban,lan_chay,giay,byte_doc,byte_gui,dung_luong_kho,may,kich_thuoc_du_lieu,so_file,mo_ta,ghi_chu
+2026-10-14T11:05:24+07:00,v1,1,53.850,1717807685,339816293,339815868,Duy2424,517508784,5229,full,seed=2026 size=500MB digest0=f0040b2508fa server=local system_state=bo_qua bkup=backup_user1_20261014_110524.bkup
+2026-10-14T11:06:24+07:00,v1,2,62.217,1733959825,341348213,681163656,Duy2424,524491115,5229,mutate 5% vong 1,seed=2026 size=500MB digest0=f0040b2508fa server=local system_state=bo_qua bkup=backup_user1_20261014_110624.bkup
+2026-10-14T11:07:42+07:00,v1,3,71.382,1782849801,352768149,1033931380,Duy2424,537516517,5229,mutate 5% vong 2,seed=2026 size=500MB digest0=f0040b2508fa server=local system_state=bo_qua bkup=backup_user1_20261014_110742.bkup

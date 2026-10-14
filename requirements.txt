@@ -12,3 +12,7 @@ flask==3.0.0
 werkzeug==3.0.1
 requests==2.31.0
 cryptography==42.0.5
+
+# ----- v2 (DACN) -----
+# pytest - chay test v2 (python -m pytest -q)
+pytest==8.3.3
