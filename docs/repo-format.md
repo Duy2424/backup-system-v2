@@ -190,6 +190,7 @@ ID là HMAC có khoá nên không lộ nội dung; offset/độ dài từng blob
     { "path": "du_lieu/tai_lieu", "type": "dir", "mtime_ns": 1767225600000000000, "attrs": 16 },
     { "path": "du_lieu/tai_lieu/Báo cáo tháng 01.docx", "type": "file",
       "size": 183442, "mtime_ns": 1767225660000000000, "attrs": 32,
+      "sha256": "5d41…64 hex (SHA-256 cả file, để khôi phục so lại)",
       "chunks": ["9f2c…64 hex", "0a7e…64 hex"] },
     { "path": "du_lieu/rong.txt", "type": "file", "size": 0, "mtime_ns": 1767225720000000000,
       "attrs": 32, "chunks": [] }
@@ -307,7 +308,9 @@ Kho làm theo thứ tự:
 #### (3) `GET /packs/<pack_id>` — tải pack
 
 - `200` + body nguyên vẹn, `Content-Type: application/octet-stream`, `ETag: "<pack_id>"`.
-- **Nên hỗ trợ `Range: bytes=a-b` ⇒ `206`** (tuần 4: khôi phục 1 file chỉ tải đúng các blob cần).
+- **Nên hỗ trợ `Range: bytes=a-b` và dạng hậu tố `Range: bytes=-N` ⇒ `206`**. Khôi phục một file (đã làm ở tuần 4)
+  đọc `bytes=-16` (footer) → `bytes=-(L+32n+16)` (index + bảng ID) → `bytes=a-b` cho đúng blob cần.
+  Đo thử: file 934 KB chỉ tải 937 KB thay vì 26 MB pack. Flask `send_file(conditional=True)` đã hỗ trợ sẵn cả hai dạng.
 - `404 not_found` nếu không có; `416 range_not_satisfiable` nếu Range sai.
 
 #### (4) `PUT /snapshots/<snapshot_id>` — ghi snapshot (luôn là bước CUỐI)

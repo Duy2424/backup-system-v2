@@ -106,8 +106,13 @@ class FileCache:
     def __len__(self):
         return len(self._m)
 
-    def lookup(self, entry):
+    def match(self, entry):
+        """Ban ghi cua snapshot truoc neu file khong doi (cung path + size + mtime_ns)."""
         e = self._m.get(entry.path)
         if e and e.get("size") == entry.size and e.get("mtime_ns") == entry.mtime_ns:
-            return e.get("chunks")
+            return e
         return None
+
+    def lookup(self, entry):
+        e = self.match(entry)
+        return e.get("chunks") if e else None

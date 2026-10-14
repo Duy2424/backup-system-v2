@@ -250,16 +250,20 @@ class Repository:
                 tree.append(e.to_tree())
                 st["dirs"] += 1
                 continue
-            cached = cache.lookup(e)
-            if cached is not None:
+            prev = cache.match(e)
+            if prev is not None:
+                cached = prev.get("chunks", [])
                 known.update(cached)
-                tree.append(e.to_tree(list(cached)))
+                item = e.to_tree(list(cached))
+                if prev.get("sha256"):
+                    item["sha256"] = prev["sha256"]
+                tree.append(item)
                 st["files"] += 1
                 st["files_cached"] += 1
                 st["bytes"] += e.size
                 st["chunks"] += len(cached)
                 continue
-            ids, size = [], 0
+            ids, size, fh = [], 0, hashlib.sha256()
             try:
                 with open(long_path(e.abs), "rb", buffering=0) as f:
                     for data in iter_chunks(f, self.params, size_hint=e.size):
@@ -267,6 +271,7 @@ class Repository:
                         h = cid.hex()
                         ids.append(h)
                         size += len(data)
+                        fh.update(data)
                         prog.add(len(data), e.path)
                         if h not in known:
                             batch.append((cid, data))
@@ -277,6 +282,7 @@ class Repository:
                 errors.append({"path": e.abs, "error": str(err)})
                 continue
             item = e.to_tree(ids)
+            item["sha256"] = fh.hexdigest()             # de khoi phuc so lai tung file
             if size != e.size:
                 item["size"] = size
                 item["changed_during_backup"] = True
@@ -305,8 +311,17 @@ class Repository:
         prog.final("xong")
         return {"snapshot_id": sid, "parent": parent_id, "stats": st, "errors": errors}
 
-    # ================================================================= restore
-    def restore(self, snapshot_id, target, include=None, progress=None):
+    # ================================================================= duyet / restore
+    def ls(self, snapshot_id, prefix=None):
+        """Cac muc trong snapshot (loc theo tien to duong dan) - de chon file can khoi phuc."""
+        tree = self.load_snapshot(snapshot_id)["tree"]
+        if prefix:
+            p = prefix.strip("/").replace("\\", "/")
+            tree = [e for e in tree if e["path"] == p or e["path"].startswith(p + "/")]
+        return [{k: e.get(k) for k in ("path", "type", "size", "mtime_ns", "sha256")} for e in tree]
+
+    def restore(self, snapshot_id, target, include=None, progress=None, partial=None):
+        """partial (mac dinh = co include): chi tai index + dung cac mau can (Range), khong tai ca pack."""
         t0 = time.perf_counter()
         snap = self.load_snapshot(snapshot_id)
         tree = snap["tree"]
@@ -325,7 +340,7 @@ class Repository:
             raise IntegrityError(f"Kho thiếu {len(lost)} mẩu mà snapshot cần (vd {lost[0][:12]})")
 
         target = os.path.abspath(target)
-        cache = _PackCache(self)
+        cache = _RangeFetcher(self) if (partial if partial is not None else bool(include)) else _PackCache(self)
         prog = _Progress(progress, sum(e["size"] for e in files))
         st = {"files": 0, "dirs": 0, "bytes": 0}
 
@@ -343,16 +358,20 @@ class Repository:
             dest = dest_of(e["path"])
             os.makedirs(long_path(os.path.dirname(dest)), exist_ok=True)
             tmp = dest + ".bks-part"
-            size = 0
+            size, fh = 0, hashlib.sha256()
             try:
                 with open(long_path(tmp), "wb") as out:
                     for h in e["chunks"]:
                         data = cache.chunk(h, loc[h])
                         out.write(data)
+                        fh.update(data)
                         size += len(data)
                         prog.add(len(data), e["path"])
                 if size != e["size"]:
                     raise IntegrityError(f"{e['path']}: kích thước khôi phục {size} != {e['size']}")
+                if e.get("sha256") and fh.hexdigest() != e["sha256"]:
+                    raise IntegrityError(f"{e['path']}: SHA-256 sau khôi phục không khớp lúc sao lưu")
+                st["verified"] = st.get("verified", 0) + bool(e.get("sha256"))
                 _make_writable(dest)
                 os.replace(long_path(tmp), long_path(dest))
             except BaseException:
@@ -440,6 +459,37 @@ class _PackCache:
         if e is None:
             raise IntegrityError(f"pack {pack_id[:12]} không chứa mẩu {cid_hex[:12]}")
         return self.repo.keys.decrypt_chunk(e.id, packer.blob_of(data, e), e.raw_length)
+
+
+class _RangeFetcher:
+    """Khoi phuc tung file: doc duoi pack (index) roi CHI tai blob can (Range), khong tai ca pack.
+    Toan ven: index xac thuc GCM (gom bang ID), moi blob xac thuc GCM + HMAC, file so SHA-256."""
+
+    def __init__(self, repo):
+        self.repo = repo
+        self._index = {}
+        self.packs_read = self.bytes_read = 0
+
+    def _entries(self, pack_id):
+        ent = self._index.get(pack_id)
+        if ent is None:
+            b = self.repo.backend
+            foot = b.get_pack_tail(pack_id, packer.FOOTER.size)
+            index_len, n = packer.parse_footer(foot)
+            tail = b.get_pack_tail(pack_id, packer.tail_size(index_len, n))
+            self.bytes_read += len(foot) + len(tail)
+            ent = {e.id.hex(): e for e in packer.read_index_from_tail(self.repo.keys, tail)}
+            self._index[pack_id] = ent
+            self.packs_read += 1
+        return ent
+
+    def chunk(self, cid_hex, pack_id):
+        e = self._entries(pack_id).get(cid_hex)
+        if e is None:
+            raise IntegrityError(f"pack {pack_id[:12]} không chứa mẩu {cid_hex[:12]}")
+        blob = self.repo.backend.get_pack(pack_id, e.offset, e.offset + e.length)
+        self.bytes_read += len(blob)
+        return self.repo.keys.decrypt_chunk(e.id, blob, e.raw_length)
 
 
 def _make_writable(path):

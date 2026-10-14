@@ -102,11 +102,17 @@ def create_stub_app(root, fail_after_packs=None, flaky=0):
         data = repo.get_pack(pid)
         rng = request.headers.get("Range")
         if rng:
-            m = re.fullmatch(r"bytes=(\d+)-(\d*)", rng)
-            if not m or int(m.group(1)) >= len(data):
+            m = re.fullmatch(r"bytes=(\d*)-(\d*)", rng)
+            if not m or (not m.group(1) and not m.group(2)):
                 return err(416, "range_not_satisfiable", rng)
-            a = int(m.group(1))
-            b = int(m.group(2)) if m.group(2) else len(data) - 1
+            if not m.group(1):                                   # dang hau to: bytes=-N
+                a, b = max(0, len(data) - int(m.group(2))), len(data) - 1
+            else:
+                a = int(m.group(1))
+                b = min(int(m.group(2)), len(data) - 1) if m.group(2) else len(data) - 1
+            if a >= len(data):
+                return err(416, "range_not_satisfiable", rng)
+            app.config["stub_state"]["range_bytes"] = app.config["stub_state"].get("range_bytes", 0) + (b - a + 1)
             return data[a:b + 1], 206, {"Content-Type": "application/octet-stream",
                                         "Content-Range": f"bytes {a}-{b}/{len(data)}"}
         return data, 200, {"Content-Type": "application/octet-stream", "ETag": f'"{pid}"'}

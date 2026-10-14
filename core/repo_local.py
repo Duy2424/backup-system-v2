@@ -174,6 +174,16 @@ class LocalRepo(Backend):
         except FileNotFoundError:
             raise NotFound(f"Không có pack {pack_id}") from None
 
+    def get_pack_tail(self, pack_id, n):
+        p = self._pack_path(_check_id(pack_id, "pack_id"))
+        try:
+            with open(p, "rb") as f:
+                size = f.seek(0, os.SEEK_END)
+                f.seek(max(0, size - n))
+                return f.read()
+        except FileNotFoundError:
+            raise NotFound(f"Không có pack {pack_id}") from None
+
     # ------------------------------------------------------------ snapshot
     def put_snapshot(self, snapshot_id, data):
         _check_id(snapshot_id, "snapshot_id")

@@ -108,7 +108,23 @@ def cmd_restore(args):
     if not args.quiet:
         sys.stderr.write("\n")
     print(f"Khôi phục {sid[:12]} -> {args.target}: {vn_int(st['files'])} file, {vn_int(st['dirs'])} thư mục, "
-          f"{vn_mb(st['bytes'])}, đọc {st['packs_read']} pack, {vn_num(st['seconds'], 2)} giây")
+          f"{vn_mb(st['bytes'])}, tải {vn_mb(st['bytes_downloaded'])} từ {st['packs_read']} pack, "
+          f"{vn_int(st.get('verified', 0))} file khớp SHA-256, {vn_num(st['seconds'], 2)} giây")
+
+
+def cmd_ls(args):
+    repo = Repository.open(_backend(args), _password(args))
+    sid = repo.resolve(args.snapshot)
+    items = repo.ls(sid, args.path)
+    if args.json:
+        print(json.dumps(items, ensure_ascii=False, indent=1))
+        return
+    for e in items:
+        if e["type"] == "dir":
+            print(f"{'<thư mục>':>12}  {e['path']}/")
+        else:
+            print(f"{vn_int(e['size']):>12}  {e['path']}")
+    print(f"-- {len(items)} mục trong snapshot {sid[:12]}")
 
 
 def cmd_snapshots(args):
@@ -181,6 +197,12 @@ def main(argv=None):
     p.add_argument("--include", help="chỉ khôi phục đường dẫn này (vd du_lieu/van_ban)")
     p.add_argument("--quiet", action="store_true")
     p.set_defaults(fn=cmd_restore)
+
+    p = sub.add_parser("ls", parents=[common], help="duyệt nội dung một snapshot")
+    p.add_argument("snapshot", nargs="?", default="latest")
+    p.add_argument("path", nargs="?", help="chỉ hiện dưới đường dẫn này")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_ls)
 
     p = sub.add_parser("snapshots", parents=[common], help="liệt kê snapshot")
     p.add_argument("--json", action="store_true")

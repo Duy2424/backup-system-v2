@@ -86,8 +86,9 @@ class PackWriter:
 
 # ================================================================ doc / kiem tra
 
-def parse_footer(tail16, total_size):
-    """(index_len, n) tu 16 byte cuoi. Kiem tra rang buoc kich thuoc (khong can khoa)."""
+def parse_footer(tail16, total_size=None):
+    """(index_len, n) tu 16 byte cuoi. Kiem tra rang buoc kich thuoc (khong can khoa).
+    total_size=None: chua biet kich thuoc pack (doc tung phan qua Range) -> bo qua kiem tra vung blob."""
     if len(tail16) != FOOTER.size:
         raise IntegrityError("pack: thiếu footer")
     index_len, n, magic = FOOTER.unpack(tail16)
@@ -95,10 +96,32 @@ def parse_footer(tail16, total_size):
         raise IntegrityError("pack: sai magic footer")
     if not 1 <= n <= MAX_CHUNKS or index_len != 28 + 48 * n:
         raise IntegrityError("pack: footer không hợp lệ")
-    blob_region = total_size - len(HEADER) - index_len - ID_LEN * n - FOOTER.size
-    if blob_region < MIN_BLOB * n:
-        raise IntegrityError("pack: kích thước không khớp footer")
+    if total_size is not None:
+        blob_region = total_size - len(HEADER) - index_len - ID_LEN * n - FOOTER.size
+        if blob_region < MIN_BLOB * n:
+            raise IntegrityError("pack: kích thước không khớp footer")
     return index_len, n
+
+
+def read_index_from_tail(keys, tail):
+    """Giai ma index tu PHAN DUOI pack (index ma hoa + bang ID + footer) - khong can ca pack."""
+    index_len, n = parse_footer(tail[-FOOTER.size:])
+    if len(tail) < index_len + ID_LEN * n + FOOTER.size:
+        raise IntegrityError("pack: phần đuôi quá ngắn")
+    ids_start = len(tail) - FOOTER.size - ID_LEN * n
+    table = tail[ids_start:ids_start + ID_LEN * n]
+    index = keys.open(tail[ids_start - index_len:ids_start], INDEX_AAD + table, "index pack")
+    entries = [IndexEntry(*ENTRY.unpack_from(index, i * ENTRY.size)) for i in range(n)]
+    pos = len(HEADER)
+    for i, e in enumerate(entries):
+        if e.id != table[i * ID_LEN:(i + 1) * ID_LEN] or e.offset != pos or e.length < MIN_BLOB:
+            raise IntegrityError("pack: index không khớp bảng ID / vị trí")
+        pos += e.length
+    return entries
+
+
+def tail_size(index_len, n):
+    return index_len + ID_LEN * n + FOOTER.size
 
 
 def parse_structure(data):

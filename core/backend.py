@@ -22,6 +22,10 @@ class Backend(ABC):
     def get_pack(self, pack_id, start=None, end=None):
         """Byte cua pack (hoac doan [start, end) neu co)."""
 
+    def get_pack_tail(self, pack_id, n):
+        """n byte CUOI cua pack (HTTP: Range: bytes=-n). Dung de doc index ma khong tai ca pack."""
+        return self.get_pack(pack_id)[-n:]
+
     @abstractmethod
     def put_snapshot(self, snapshot_id, data):
         """-> "created" | "exists". Luon goi SAU CUNG."""

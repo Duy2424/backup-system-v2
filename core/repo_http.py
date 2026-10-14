@@ -125,6 +125,10 @@ class HttpRepo(Backend):
             headers = {"Range": f"bytes={start}-" + ("" if end is None else str(end - 1))}
         return self._req("GET", f"/packs/{pack_id}", ok=(200, 206), headers=headers).content
 
+    def get_pack_tail(self, pack_id, n):
+        r = self._req("GET", f"/packs/{pack_id}", ok=(200, 206), headers={"Range": f"bytes=-{int(n)}"})
+        return r.content[-n:]          # server khong ho tro Range (200) -> van dung
+
     def put_snapshot(self, snapshot_id, data):
         return self._put_bytes(f"/snapshots/{snapshot_id}", data)
 
