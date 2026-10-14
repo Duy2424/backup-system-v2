@@ -1,18 +1,19 @@
-# Thu vien cho he thong backup (ban da pin dung version theo bao cao - muc 3.2.1)
-# Cai dat: pip install -r requirements.txt
+# Thu vien cho he thong backup (pin dung version)
+# Cai dat: python -m pip install -r requirements.txt
 #
-# Flask        - web framework cho Storage Server (web UI + REST API)
-# Werkzeug     - WSGI core cua Flask (di kem Flask, pin de tranh lech version)
-# Requests     - agent goi REST API len server (HTTP client)
-# cryptography - ma hoa AES-256 CBC + sinh khoa Fernet theo tung user
-#
-# (Jinja2, click, itsdangerous, blinker se duoc cai keo theo Flask.)
+# Flask        - web dieu khien + REST API (server)
+# Werkzeug     - WSGI core cua Flask
+# waitress     - WSGI server cho Windows khi chay that (thay server thu nghiem cua Flask)
+# Requests     - agent goi REST API len server
+# cryptography - AES-256-GCM (ban moi), AES-CBC (doc ban backup cu), scrypt/HKDF
+# zstandard    - nen zstd da luong (thay gzip cua v1 goc)
 
 flask==3.0.0
 werkzeug==3.0.1
+waitress==3.0.2
 requests==2.31.0
 cryptography==42.0.5
+zstandard==0.23.0
 
-# ----- v2 (DACN) -----
-# pytest - chay test v2 (python -m pytest -q)
+# ----- v2 (DACN) / kiem thu -----
 pytest==8.3.3

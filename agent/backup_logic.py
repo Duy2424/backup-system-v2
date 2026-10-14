@@ -1,315 +1,309 @@
 """
-Backup Logic - thuc hien backup tren agent (Win 2012)
+Backup (ban v1 toi uu).
 
-Quy trinh day du:
-1. Tao snapshot (manifest SHA-256) cua tat ca file
-2. Capture system state: network adapter, firewall, defender
-3. Backup SQL Server databases (neu co)
-4. Backup Windows Registry keys quan trong
-5. Dong goi tat ca thanh 1 file tar.gz
-6. Ma hoa AES-256
-7. Upload len server (Win 2016) vao folder rieng cua user
+Luong du lieu - moi file nguon chi DOC 1 LAN, khong ghi file tam:
+
+  file ──► bam SHA-256 ──► tar ──► zstd (da luong) ──► AES-256-GCM theo doan ──► queue ──► HTTP PUT (chunked)
+                                                                                 (thread upload)
+
+So voi v1 goc (bam 1 luot + tar.gz 1 luot + doc lai tar + doc lai .bkup + nap ca file vao RAM
+khi upload multipart): it doc dia hon ~3 lan, nen nhanh hon, RAM co dinh (~16 MiB).
+
+Cau truc tar (giu tuong thich restore cu):
+  _meta/metadata.json, _meta/system_state.json, _sql/*.bak, _registry/*.reg,
+  _data/<rel>..., _meta/snapshot.json (cuoi cung vi can hash cua tung file)
 """
-# Auto-add shared/ to import path (cho phep import config, database, snapshot, encryption_utils)
-import sys
-import os
-_SHARED = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "shared"))
-if _SHARED not in sys.path:
-    sys.path.insert(0, _SHARED)
-
-import os
-import tarfile
+import hashlib
+import io
 import json
+import logging
+import os
+import queue
+import re
 import shutil
+import tarfile
+import threading
+import time
 from datetime import datetime
 
-import config
-import snapshot
-import system_state
-import encryption_utils
-import sql_registry
-from remote_storage import RemoteStorageClient
+import zstandard
+
+from shared import config
+from shared.encryption_utils import EncryptWriter
+from shared.snapshot import ExcludeMatcher, long_path, scan_files
+from shared.text import vn_int, vn_mb, vn_num
+from agent import sql_registry, system_state
+from agent.remote_storage import RemoteStorageClient
+
+log = logging.getLogger("agent.backup")
+
+FORMAT_VERSION = "1.5"
+ZSTD_LEVEL = 3
+COPY_BUF = 1024 * 1024
+_QUEUE_DEPTH = 16          # ~16 MiB dem giua nen va upload
+
+
+class JobCancelled(Exception):
+    """Nguoi dung bam Huy tren web."""
+
+
+class _Aborted(Exception):
+    pass
+
+
+class _QueueSink:
+    """Dau cuoi pipeline: day tung doan da ma hoa vao queue cho thread upload."""
+
+    def __init__(self, q, abort):
+        self.q, self.abort = q, abort
+
+    def write(self, b):
+        data = bytes(b)
+        while True:
+            if self.abort.is_set():
+                raise _Aborted()
+            try:
+                self.q.put(data, timeout=0.5)
+                return len(data)
+            except queue.Full:
+                continue
+
+
+class _Counter(io.RawIOBase):
+    """Lop mong cho tarfile (can tell()) + dem byte chua nen."""
+
+    def __init__(self, inner):
+        super().__init__()
+        self.inner, self.n = inner, 0
+
+    def writable(self):
+        return True
+
+    def write(self, b):
+        self.inner.write(b)
+        self.n += len(b)
+        return len(b)
+
+    def tell(self):
+        return self.n
+
+
+class _HashingReader:
+    """Doc DUNG `size` byte (tarfile yeu cau), bam SHA-256 tren duong di.
+    File bi rut ngan giua chung -> bu 0 va danh dau; file dai them -> chi lay `size` byte."""
+
+    def __init__(self, f, size, on_bytes):
+        self.f, self.left, self.on_bytes = f, size, on_bytes
+        self.h = hashlib.sha256()
+        self.changed = False
+
+    def read(self, n=-1):
+        if n is None or n < 0 or n > self.left:
+            n = self.left
+        parts, got = [], 0
+        while got < n:
+            b = self.f.read(n - got)
+            if not b:
+                self.changed = True
+                b = b"\x00" * (n - got)
+            parts.append(b)
+            got += len(b)
+        data = b"".join(parts) if len(parts) != 1 else parts[0]
+        self.left -= len(data)
+        self.h.update(data)
+        self.on_bytes(len(data))
+        return data
+
+
+def _add_bytes(tar, name, data, mtime=None):
+    ti = tarfile.TarInfo(name)
+    ti.size = len(data)
+    ti.mtime = mtime or time.time()
+    tar.addfile(ti, io.BytesIO(data))
+
+
+def _safe_name(s):
+    return re.sub(r"[^A-Za-z0-9_-]", "_", s)[:40] or "user"
 
 
 def perform_backup(user, paths=None, backup_type="full", components=None, progress_cb=None):
     """
-    Thuc hien backup (ho tro backup CHON LOC theo thanh phan).
-
-    Args:
-        user: dict thong tin user
-        paths: list duong dan can backup (chi dung khi co thanh phan 'files')
-        backup_type: 'full' hoac 'selected'
-        components: list thanh phan can backup (xem config.BACKUP_COMPONENTS).
-                    None = backup toan bo (full).
-        progress_cb: callable(percent, message)
-
-    Returns:
-        dict: { success, filename, size, components, snapshot_summary }
+    Backup chon loc theo thanh phan. Tra ve dict:
+      {success, filename, size, sha256, components, snapshot_summary, stats}
+    progress_cb(percent, message) co the nem JobCancelled de dung.
     """
-    def _progress(p, m):
-        if progress_cb:
-            progress_cb(p, m)
-        print(f"[backup {p:3d}%] {m}")
+    t_start = time.perf_counter()
 
-    # ----- Chuan hoa danh sach thanh phan -----
-    if components is None:
-        components = list(config.BACKUP_COMPONENTS)
-    components = [c for c in components if c in config.BACKUP_COMPONENTS]
-    if not components:
-        components = list(config.BACKUP_COMPONENTS)
-    do_files = "files" in components
-    is_full = set(components) >= set(config.BACKUP_COMPONENTS)
+    def progress(p, m, cancellable=True):
+        if progress_cb:
+            try:
+                progress_cb(int(p), m)
+            except JobCancelled:
+                if cancellable:
+                    raise
+                # Du lieu da len kho xong: huy luc nay chi de lai file mo coi -> cho hoan tat
+        log.info("[%3d%%] %s", int(p), m)
+
+    # ----- thanh phan -----
+    comps = [c for c in (components or config.BACKUP_COMPONENTS) if c in config.BACKUP_COMPONENTS]
+    comps = comps or list(config.BACKUP_COMPONENTS)
+    do_files = "files" in comps
+    is_full = set(comps) >= set(config.BACKUP_COMPONENTS)
     backup_type = "full" if is_full else "selected"
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_name = f"backup_{user['username']}_{timestamp}"
-    work_dir = os.path.join(config.BACKUP_TEMP_DIR, backup_name)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"backup_{_safe_name(user['username'])}_{stamp}.bkup"
+    work_dir = os.path.join(config.BACKUP_TEMP_DIR, filename[:-5])
     os.makedirs(work_dir, exist_ok=True)
-
-    _progress(2, f"Bat dau backup ({'toan bo' if is_full else 'chon loc'}): {', '.join(components)}")
+    progress(1, f"Bắt đầu sao lưu ({'toàn bộ' if is_full else 'chọn lọc'}): {', '.join(comps)}")
 
     try:
-        snap = None
-        snap_path = None
-        used_paths = []
-
-        # ===== BUOC 1: SNAPSHOT (chi khi co thanh phan 'files') =====
+        # ===== 1. Danh sach file (chi metadata, chua doc noi dung) =====
+        file_list, used_paths, skipped = [], [], []
         if do_files:
-            paths = paths or config.DEFAULT_BACKUP_PATHS
-            paths = [p for p in paths if os.path.exists(p)]
-            if not paths:
-                _progress(0, f"CANH BAO: Duong dan khong ton tai: {config.DEFAULT_BACKUP_PATHS}")
-                sample = os.path.join(config.BASE_DIR, "agent", "sample_data")
-                if not os.path.exists(sample):
-                    sample = os.path.join(config.BASE_DIR, "sample_data")
-                if os.path.exists(sample):
-                    paths = [sample]
-                    _progress(0, "Su dung thu muc sample_data thay the...")
-                else:
-                    raise ValueError("Khong co duong dan nao ton tai de backup")
-            used_paths = paths
-            _progress(5, "Dang tao snapshot (quet va hash tat ca file)...")
-            snap = snapshot.create_snapshot(paths, exclude_patterns=config.EXCLUDE_PATTERNS)
-            snap_path = os.path.join(work_dir, "snapshot.json")
-            snapshot.save_snapshot(snap, snap_path)
-            local_snap = os.path.join(config.SNAPSHOTS_DIR, f"user_{user['id']}_latest.json")
-            snapshot.save_snapshot(snap, local_snap)
-            _progress(15, f"Snapshot xong: {snap['total_files']} files, {snap['total_size'] / 1024 / 1024:.2f} MB")
-        else:
-            _progress(15, "Bo qua backup file (khong tick thanh phan 'files').")
+            used_paths = [p for p in (paths or config.DEFAULT_BACKUP_PATHS) if os.path.exists(p)]
+            if not used_paths:
+                raise ValueError(f"Không có đường dẫn nào tồn tại để sao lưu: {paths or config.DEFAULT_BACKUP_PATHS}")
+            progress(2, "Đang quét thư mục...")
+            matcher = ExcludeMatcher.from_config(config)
+            file_list = list(scan_files(used_paths, matcher,
+                                        on_error=lambda p, e: skipped.append({"path": p, "error": str(e)})))
+        total_bytes = sum(st.st_size for _, _, st in file_list)
+        if do_files:
+            progress(5, f"Tìm thấy {vn_int(len(file_list))} file, {vn_mb(total_bytes)}")
 
-        # ===== BUOC 2: SYSTEM STATE (loc theo thanh phan da chon) =====
-        _progress(20, "Dang capture system state...")
-        full_state = system_state.capture_system_state()
-        sys_st = _select_system_state(full_state, components)
-        sys_st_path = os.path.join(work_dir, "system_state.json")
-        with open(sys_st_path, "w", encoding="utf-8") as f:
-            json.dump(sys_st, f, indent=2, ensure_ascii=False, default=str)
-        _log_state_summary(sys_st, _progress)
-
-        # ===== BUOC 3+4: SQL + REGISTRY (chi khi backup toan bo) =====
-        bak_files = []
-        reg_files = []
-        reg_dir = os.path.join(work_dir, "registry")
+        # ===== 2. System state / SQL / Registry =====
+        progress(6, "Đang ghi nhận cấu hình hệ thống...")
+        sys_state = system_state.capture_system_state(comps)
+        bak_files, reg_files = [], []
         if is_full:
-            _progress(25, "Dang kiem tra va backup SQL Server...")
-            sql_dir = os.path.join(work_dir, "sql_backups")
             if sql_registry.has_sql_server():
-                bak_files = sql_registry.backup_all_sql(sql_dir)
-                _progress(35, f"  SQL backup xong: {len(bak_files)} database(s)")
-            else:
-                _progress(28, "  Khong co SQL Server, bo qua")
-            _progress(38, "Dang backup Windows Registry...")
-            reg_files = sql_registry.backup_registry(reg_dir)
-            _progress(42, f"  Registry backup xong: {len(reg_files)} keys")
-        else:
-            _progress(42, "Backup chon loc - bo qua SQL Server & Registry.")
+                progress(8, "Đang sao lưu SQL Server...")
+                bak_files = sql_registry.backup_all_sql(os.path.join(work_dir, "sql"))
+            progress(10, "Đang xuất Windows Registry...")
+            reg_files = sql_registry.backup_registry(os.path.join(work_dir, "registry"))
 
-        # ===== BUOC 5: NEN =====
-        _progress(45, "Dang nen tat ca vao 1 file tar.gz...")
-        tar_path = os.path.join(work_dir, "archive.tar.gz")
-        with tarfile.open(tar_path, "w:gz", compresslevel=6) as tar:
-            meta = {
-                "user_id": user["id"],
-                "username": user["username"],
-                "created_at": datetime.now().isoformat(),
-                "backup_type": backup_type,
-                "components": components,
-                "paths": used_paths,
-                "version": "2.1",
-                "has_files": do_files,
-                "has_sql": len(bak_files) > 0,
-                "has_registry": len(reg_files) > 0,
-            }
-            meta_path = os.path.join(work_dir, "metadata.json")
-            with open(meta_path, "w", encoding="utf-8") as f:
-                json.dump(meta, f, indent=2, ensure_ascii=False)
-            tar.add(meta_path, arcname="_meta/metadata.json")
-            tar.add(sys_st_path, arcname="_meta/system_state.json")
-            if do_files and snap_path:
-                tar.add(snap_path, arcname="_meta/snapshot.json")
-
-            for bak in bak_files:
-                tar.add(bak, arcname=f"_sql/{os.path.basename(bak)}")
-            if is_full and os.path.exists(reg_dir):
-                for rf in os.listdir(reg_dir):
-                    tar.add(os.path.join(reg_dir, rf), arcname=f"_registry/{rf}")
-
-            if do_files and snap:
-                total_files = len(snap["files"])
-                _progress(50, f"Dang nen {total_files} files...")
-                for i, (rel_path, info) in enumerate(snap["files"].items()):
-                    abs_path = info.get("abs_path")
-                    if abs_path and os.path.exists(abs_path):
-                        try:
-                            tar.add(abs_path, arcname=f"_data/{rel_path}")
-                        except (PermissionError, OSError) as e:
-                            print(f"  [WARN] Bo qua (bi lock hoac loi): {abs_path[:60]}... -> {e}")
-                    if i % 100 == 0 and total_files > 0:
-                        pct = 50 + int(20 * i / total_files)
-                        _progress(pct, f"  Nen file {i:,}/{total_files:,}")
-
-        tar_size = os.path.getsize(tar_path)
-        _progress(70, f"Nen xong: {tar_size / 1024 / 1024:.2f} MB")
-
-        # ===== BUOC 6: MA HOA =====
-        _progress(75, "Dang ma hoa AES-256...")
-        enc_filename = f"{backup_name}.bkup"
-        enc_path = os.path.join(work_dir, enc_filename)
-        encryption_utils.encrypt_file(tar_path, enc_path, user["encryption_key"])
-        enc_size = os.path.getsize(enc_path)
-        _progress(82, f"Ma hoa xong: {enc_size / 1024 / 1024:.2f} MB")
-
-        # ===== BUOC 7: UPLOAD =====
-        _progress(85, f"Dang upload len server ({config.SERVER_URL})...")
+        # ===== 3. Pipeline tar -> zstd -> AES-GCM -> upload =====
         client = RemoteStorageClient(config.SERVER_URL, user["token"])
         if not client.ping():
-            raise ConnectionError(f"Khong ket noi duoc den server {config.SERVER_URL}")
-        result = client.upload(enc_path, enc_filename)
-        _progress(95, f"Upload xong: {enc_size / 1024 / 1024:.2f} MB da len server")
+            raise ConnectionError(f"Không kết nối được server {config.SERVER_URL}")
 
-        shutil.rmtree(work_dir, ignore_errors=True)
-        _progress(100, f"BACKUP HOAN TAT! File: {enc_filename} ({enc_size / 1024 / 1024:.2f} MB)")
+        q, abort = queue.Queue(maxsize=_QUEUE_DEPTH), threading.Event()
+        upload_result, upload_error = {}, []
 
-        return {
-            "success": True,
-            "filename": enc_filename,
-            "size": enc_size,
-            "components": components,
-            "snapshot_summary": {
-                "total_files": snap["total_files"] if snap else 0,
-                "total_size": snap["total_size"] if snap else 0,
-                "components": components,
-            },
-            "remote_path": result.get("path"),
-        }
+        def chunks():
+            while True:
+                try:
+                    item = q.get(timeout=0.5)
+                except queue.Empty:
+                    if abort.is_set():
+                        raise _Aborted() from None
+                    continue
+                if item is None:
+                    return
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
 
-    except Exception:
-        shutil.rmtree(work_dir, ignore_errors=True)
-        raise
-
-
-def _select_system_state(full_state, components):
-    """Loc system_state day du -> chi giu cac thanh phan da tick chon.
-    Khong them key cho thanh phan KHONG chon, de luc restore tu dong bo qua
-    (restore_system_state / restore_network_advanced chi restore key co mat).
-    """
-    sel = {
-        "platform": full_state.get("platform"),
-        "hostname": full_state.get("hostname"),
-        "components": list(components),
-    }
-
-    # IPv4 / IPv6 nam chung trong adapters
-    if "ipv4" in components or "ipv6" in components:
-        adapters = []
-        for a in full_state.get("adapters", []):
-            a2 = {
-                "name": a.get("name"), "mac": a.get("mac"),
-                "status": a.get("status"), "index": a.get("index"),
-                "mode": a.get("mode"),
-            }
-            if "ipv4" in components:
-                v4 = a.get("ipv4") or {}
-                a2["ipv4"] = v4
-                # Tuong thich nguoc: code restore cu doc field IPv4 o cap goc
-                a2.update({
-                    "ip": v4.get("ip"), "prefix": v4.get("prefix"),
-                    "subnet_mask": v4.get("subnet_mask"), "gateway": v4.get("gateway"),
-                    "dns": v4.get("dns"), "dhcp": v4.get("dhcp"),
-                })
-            if "ipv6" in components:
-                a2["ipv6"] = a.get("ipv6") or {}
-            adapters.append(a2)
-        sel["adapters"] = adapters
-
-    if "firewall" in components:
-        sel["firewall"] = full_state.get("firewall", {})
-    if "defender" in components:
-        sel["defender"] = full_state.get("defender", {})
-
-    na_full = full_state.get("network_advanced", {}) or {}
-    na = {}
-    if "route" in components:
-        na["routing_table"] = na_full.get("routing_table", [])
-    if "hosts" in components:
-        na["hosts_file"] = na_full.get("hosts_file", "")
-    if "firewall" in components:
-        na["firewall_rules"] = na_full.get("firewall_rules", [])
-    if "shares" in components:
-        na["network_shares"] = na_full.get("network_shares", [])
-    if "portproxy" in components:
-        na["port_proxy"] = na_full.get("port_proxy", [])
-    if na:
-        sel["network_advanced"] = na
-
-    return sel
-
-
-def _log_state_summary(sys_st, _progress):
-    """Log kieu demo cac thanh phan system state da capture (chi cai co mat)."""
-    for a in sys_st.get("adapters", []):
-        v4 = a.get("ipv4", {}) or {}
-        v6 = a.get("ipv6", {}) or {}
-        _progress(20, f"  Adapter: {a.get('name')} | Mode={a.get('mode')}")
-        if v4.get("ip"):
-            _progress(20, f"    IPv4: {v4.get('ip')}/{v4.get('prefix')} gw={v4.get('gateway')} dns={v4.get('dns')}")
-        if v6.get("ip"):
-            _progress(20, f"    IPv6: {v6.get('ip')}/{v6.get('prefix')} gw={v6.get('gateway')}")
-    for prof, st in sys_st.get("firewall", {}).items():
-        _progress(20, f"  Firewall {prof}: enabled={st.get('enabled')}")
-    if "defender" in sys_st:
-        _progress(20, f"  Defender: realtime={sys_st['defender'].get('realtime_enabled')}")
-    na = sys_st.get("network_advanced", {})
-    if "routing_table" in na:
-        _progress(22, f"  Routing table: {len(na.get('routing_table', []))} route(s)")
-    if "firewall_rules" in na:
-        _progress(22, f"  Firewall rules: {len(na.get('firewall_rules', []))} rule(s)")
-    if "network_shares" in na:
-        _progress(22, f"  Network shares: {len(na.get('network_shares', []))} share(s)")
-    if "port_proxy" in na:
-        _progress(22, f"  Port proxy: {len(na.get('port_proxy', []))} rule(s)")
-    if "hosts_file" in na:
-        _progress(22, f"  Hosts file: {len(na.get('hosts_file', ''))} bytes")
-
-
-def _estimate_size(paths):
-    """Uoc tinh tong size cua tat ca paths"""
-    total = 0
-    for p in paths:
-        if os.path.isfile(p):
+        def uploader():
             try:
-                total += os.path.getsize(p)
-            except OSError:
-                pass
-        elif os.path.isdir(p):
-            for root, dirs, files in os.walk(p):
-                # Loai bo thu muc bi exclude
-                dirs[:] = [d for d in dirs if not any(
-                    e in d for e in config.EXCLUDE_PATTERNS)]
-                for f in files:
+                upload_result.update(client.upload_stream(filename, chunks()))
+            except BaseException as e:      # noqa: BLE001 - chuyen loi ve thread chinh
+                upload_error.append(e)
+                abort.set()
+
+        th = threading.Thread(target=uploader, name="upload", daemon=True)
+        th.start()
+
+        snap_files = {}
+        done = [0]
+        last_report = [0.0]
+
+        def on_bytes(n):
+            done[0] += n
+            now = time.monotonic()
+            if now - last_report[0] >= 0.5:
+                last_report[0] = now
+                pct = 12 + 85 * done[0] / total_bytes if total_bytes else 50
+                progress(pct, f"Đã xử lý {vn_num(done[0] / 1048576, 0)}/{vn_mb(total_bytes, 0)}")
+
+        enc = zw = None
+        try:
+            enc = EncryptWriter(_QueueSink(q, abort), user["encryption_key"])
+            zw = zstandard.ZstdCompressor(level=ZSTD_LEVEL, threads=-1).stream_writer(
+                enc, closefd=False, write_return_read=True)
+            counter = _Counter(zw)
+            with tarfile.TarFile(fileobj=counter, mode="w", format=tarfile.PAX_FORMAT,
+                                 copybufsize=COPY_BUF) as tar:
+                meta = {
+                    "user_id": user["id"], "username": user["username"],
+                    "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                    "backup_type": backup_type, "components": comps, "paths": used_paths,
+                    "version": FORMAT_VERSION, "compression": "zstd", "has_files": do_files,
+                    "has_sql": bool(bak_files), "has_registry": bool(reg_files),
+                }
+                _add_bytes(tar, "_meta/metadata.json", json.dumps(meta, ensure_ascii=False, indent=1).encode())
+                _add_bytes(tar, "_meta/system_state.json",
+                           json.dumps(sys_state, ensure_ascii=False, default=str).encode())
+                for b in bak_files:
+                    tar.add(b, arcname=f"_sql/{os.path.basename(b)}")
+                for r in reg_files:
+                    tar.add(r, arcname=f"_registry/{os.path.basename(r)}")
+
+                for rel, abs_path, st in file_list:
                     try:
-                        total += os.path.getsize(os.path.join(root, f))
-                    except OSError:
-                        pass
-    return total
+                        f = open(long_path(abs_path), "rb")
+                    except OSError as e:
+                        skipped.append({"path": abs_path, "error": str(e)})
+                        done[0] += st.st_size
+                        continue
+                    with f:
+                        ti = tarfile.TarInfo(f"_data/{rel}")
+                        ti.size, ti.mtime, ti.mode = st.st_size, st.st_mtime, 0o644
+                        hr = _HashingReader(f, st.st_size, on_bytes)
+                        tar.addfile(ti, hr)
+                    snap_files[rel] = {"abs_path": abs_path, "size": st.st_size, "mtime": st.st_mtime,
+                                       "hash": hr.h.hexdigest(),
+                                       "attrs": getattr(st, "st_file_attributes", 0)}
+                    if hr.changed:
+                        snap_files[rel]["changed_during_backup"] = True
+
+                snapshot = {"created_at": meta["created_at"], "paths": used_paths, "files": snap_files,
+                            "total_files": len(snap_files),
+                            "total_size": sum(v["size"] for v in snap_files.values()),
+                            "skipped": skipped[:500]}
+                _add_bytes(tar, "_meta/snapshot.json", json.dumps(snapshot, ensure_ascii=False).encode())
+            zw.close()
+            enc.close()
+            q.put(None)
+        except BaseException as e:
+            abort.set()
+            if enc is not None:
+                enc.abandon()
+            th.join(30)
+            if isinstance(e, _Aborted) and upload_error:
+                raise upload_error[0] from None
+            raise
+        progress(97, "Đang chờ server xác nhận...", cancellable=False)
+        th.join()
+        if upload_error:
+            raise upload_error[0]
+
+        secs = time.perf_counter() - t_start
+        stats = {"seconds": round(secs, 2), "bytes_source": total_bytes, "bytes_tar": counter.n,
+                 "bytes_uploaded": upload_result["size"], "files": len(snap_files), "skipped": len(skipped)}
+        msg = (f"Sao lưu xong: {vn_int(len(snap_files))} file, gửi {vn_mb(upload_result['size'])} "
+               f"trong {vn_num(secs)} giây")
+        if skipped:
+            msg += f" (bỏ qua {len(skipped)} file không đọc được)"
+        progress(100, msg, cancellable=False)
+        return {
+            "success": True, "filename": filename, "size": upload_result["size"],
+            "sha256": upload_result["sha256"], "components": comps,
+            "snapshot_summary": {"total_files": len(snap_files),
+                                 "total_size": snapshot["total_size"] if do_files else 0,
+                                 "components": comps, "skipped": len(skipped)},
+            "stats": stats,
+        }
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)

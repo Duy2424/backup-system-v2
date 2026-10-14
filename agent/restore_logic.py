@@ -1,285 +1,239 @@
 """
-Restore Logic - thuc hien restore tren agent
-Quy trinh:
-1. Tai file backup tu server (Win 2016) ve agent (Win 2012)
-2. Giai ma file
-3. Giai nen ra thu muc tam
-4. Doc snapshot tu backup va tao snapshot hien tai
-5. So sanh: file thieu -> them, file du -> xoa, file khac -> ghi de
-6. Restore system state (network adapter, firewall, defender)
-"""
-# Auto-add shared/ to import path (cho phep import config, database, snapshot, encryption_utils)
-import sys
-import os
-_SHARED = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "shared"))
-if _SHARED not in sys.path:
-    sys.path.insert(0, _SHARED)
+Restore (ban v1 toi uu).
 
-import os
-import tarfile
+  HTTP GET (stream) ──► giai ma (BKP2 GCM / BKUP cu) ──► zstd | gzip ──► tar (stream) ──► thu muc tam
+                                                                  (khong luu file .bkup xuong dia)
+
+Sau khi giai nen + XAC THUC xong toan bo moi dong vao du lieu that:
+  - so sanh snapshot ban backup voi hien tai (chi bam file nghi ngo: khac mtime)
+  - them file thieu, ghi de file khac (tra lai mtime goc)
+  - (tuy chon) xoa file thua khong co trong ban backup - MAC DINH TAT
+  - (tuy chon) khoi phuc ra thu muc khac thay vi vi tri cu
+  - (tuy chon) ap lai cau hinh mang/he thong
+"""
 import json
+import logging
+import os
 import shutil
+import tarfile
+import time
 from datetime import datetime
 
-import config
-import snapshot
-import system_state
-import encryption_utils
-import sql_registry
-from remote_storage import RemoteStorageClient
+import zstandard
 
-import platform
-_IS_WINDOWS = platform.system() == "Windows"
-_MAX_PATH = 250  # An toan duoi 260 (gioi han Windows)
+from shared import config
+from shared.encryption_utils import open_decrypt_stream
+from shared.text import vn_int, vn_mb, vn_num
+from shared.snapshot import ExcludeMatcher, compare_snapshots, create_snapshot, long_path
+from agent import sql_registry, system_state
+from agent.remote_storage import RemoteStorageClient
 
+log = logging.getLogger("agent.restore")
 
-def _safe_extractall(tar_path, extract_dir):
-    """
-    Giai nen tar an toan:
-    - Xu ly duong dan qua dai (>260 ky tu tren Windows) bang prefix \\?\\
-    - Bo qua file bi loi (permission, path invalid, v.v.)
-    - Tra ve (so_file_bo_qua, so_file_ok)
-    """
-    skip_count = 0
-    ok_count = 0
-
-    def _long_path(p):
-        """Them prefix de bypass gioi han 260 ky tu tren Windows"""
-        if _IS_WINDOWS and len(p) > _MAX_PATH and not p.startswith("\\\\?\\"):
-            return "\\\\?\\" + p.replace("/", "\\")
-        return p
-
-    with tarfile.open(tar_path, "r:gz") as tar:
-        members = tar.getmembers()
-        total = len(members)
-        for i, member in enumerate(members):
-            # Tinh duong dan dich
-            dest = os.path.normpath(os.path.join(extract_dir, member.name))
-
-            # Kiem tra path traversal attack
-            if not dest.startswith(os.path.normpath(extract_dir)):
-                skip_count += 1
-                continue
-
-            try:
-                if member.isdir():
-                    # Tao thu muc voi long path support
-                    long_dest = _long_path(dest)
-                    os.makedirs(long_dest, exist_ok=True)
-                    ok_count += 1
-                elif member.isfile():
-                    # Tao thu muc cha
-                    parent = os.path.dirname(dest)
-                    long_parent = _long_path(parent)
-                    os.makedirs(long_parent, exist_ok=True)
-
-                    # Ghi file voi long path
-                    long_dest = _long_path(dest)
-                    with tar.extractfile(member) as src, \
-                         open(long_dest, "wb") as dst:
-                        while True:
-                            chunk = src.read(65536)
-                            if not chunk:
-                                break
-                            dst.write(chunk)
-                    ok_count += 1
-                else:
-                    ok_count += 1  # symlink, etc - skip silently
-
-            except (OSError, IOError, ValueError) as e:
-                err_str = str(e)
-                # Chi in warning neu khong phai loi path qua dai / permission
-                if "errno 2" not in err_str.lower() and "permission" not in err_str.lower():
-                    print(f"  [WARN extract] {member.name[:80]}: {e}")
-                skip_count += 1
-
-    return skip_count, ok_count
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+COPY_BUF = 1024 * 1024
 
 
+class _CountingReader:
+    def __init__(self, raw, on_bytes):
+        self.raw, self.on_bytes = raw, on_bytes
 
-def perform_restore(user, backup_filename, progress_cb=None, dry_run=False):
-    """
-    Thuc hien restore.
+    def read(self, n=-1):
+        b = self.raw.read(n)
+        self.on_bytes(len(b))
+        return b
 
-    Args:
-        user: dict thong tin user
-        backup_filename: ten file backup tren server
-        progress_cb: callable(percent, message)
-        dry_run: neu True chi so sanh khong thuc su restore
 
-    Returns:
-        dict: { 'success', 'compare_result', 'system_diffs' }
-    """
-    def _progress(p, m):
-        if progress_cb:
-            progress_cb(p, m)
-        print(f"[restore {p}%] {m}")
+def _open_tar_stream(plain):
+    """plain: BufferedReader da giai ma. Tu nhan dien zstd (moi) / gzip (v1 goc)."""
+    if plain.peek(4)[:4] == ZSTD_MAGIC:
+        return tarfile.open(fileobj=zstandard.ZstdDecompressor().stream_reader(plain), mode="r|")
+    return tarfile.open(fileobj=plain, mode="r|*")
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    work_dir = os.path.join(config.RESTORE_TEMP_DIR, f"restore_{timestamp}")
-    os.makedirs(work_dir, exist_ok=True)
 
+def _safe_dest(root, name):
+    """Duong dan dich an toan (chan ../, duong dan tuyet doi, o dia)."""
+    parts = [p for p in name.replace("\\", "/").split("/") if p not in ("", ".")]
+    if not parts or any(p == ".." or ":" in p for p in parts):
+        return None
+    dest = os.path.normpath(os.path.join(root, *parts))
+    if os.path.commonpath([os.path.abspath(root), os.path.abspath(dest)]) != os.path.abspath(root):
+        return None
+    return dest
+
+
+def extract_stream(tar, dest_root, dest_for=None):
+    """Giai nen tuan tu (che do stream). Chi file thuong + thu muc. Tra ve (ok, bo_qua).
+    dest_for(name) -> duong dan dich (None = bo qua); mac dinh giai nen vao dest_root."""
+    ok = skipped = 0
+    for m in tar:
+        dest = dest_for(m.name) if dest_for else _safe_dest(dest_root, m.name)
+        if dest is None or not (m.isfile() or m.isdir()):
+            skipped += 1
+            continue
+        if m.isdir():
+            os.makedirs(long_path(dest), exist_ok=True)
+            continue
+        os.makedirs(long_path(os.path.dirname(dest)), exist_ok=True)
+        src = tar.extractfile(m)
+        with open(long_path(dest), "wb") as out:
+            shutil.copyfileobj(src, out, COPY_BUF)
+        try:
+            os.utime(long_path(dest), (m.mtime, m.mtime))
+        except OSError:
+            pass
+        ok += 1
+    return ok, skipped
+
+
+def _place(src, dst, mtime=None):
+    os.makedirs(long_path(os.path.dirname(dst)), exist_ok=True)
     try:
-        # ===== BUOC 1: DOWNLOAD TU SERVER =====
-        _progress(5, f"Dang tai backup tu server: {backup_filename}")
+        os.replace(long_path(src), long_path(dst))          # cung o dia: doi ten, khong chep
+    except OSError:
+        shutil.copyfile(long_path(src), long_path(dst))
+    if mtime:
+        os.utime(long_path(dst), (mtime, mtime))
+
+
+def perform_restore(user, backup_filename, progress_cb=None, dry_run=False, delete_extra=False,
+                    target_dir=None, restore_system=True):
+    """
+    Tra ve {success, dry_run, compare_result, system_diffs, components, backup_date}.
+    progress_cb(percent, message) co the nem JobCancelled.
+    """
+    def progress(p, m):
+        if progress_cb:
+            progress_cb(int(p), m)
+        log.info("[%3d%%] %s", int(p), m)
+
+    t0 = time.perf_counter()
+    work_dir = os.path.join(config.RESTORE_TEMP_DIR, f"restore_{datetime.now():%Y%m%d_%H%M%S_%f}")
+    extract_dir = os.path.join(work_dir, "x")
+    os.makedirs(extract_dir, exist_ok=True)
+    try:
+        # ===== 1. Tai + giai ma + giai nen (stream) =====
+        progress(2, f"Đang tải {backup_filename} ...")
         client = RemoteStorageClient(config.SERVER_URL, user["token"])
-        if not client.ping():
-            raise ConnectionError(f"Khong ket noi duoc den server {config.SERVER_URL}")
+        resp = client.download_stream(backup_filename)
+        total = int(resp.headers.get("Content-Length") or 0)
+        got = [0]
+        last = [0.0]
 
-        encrypted_path = os.path.join(work_dir, backup_filename)
-        client.download(backup_filename, encrypted_path)
-        _progress(25, f"Tai xong: {os.path.getsize(encrypted_path):,} bytes")
+        def on_bytes(n):
+            got[0] += n
+            now = time.monotonic()
+            if total and now - last[0] >= 0.5:
+                last[0] = now
+                progress(3 + 57 * got[0] / total,
+                         f"Đã tải và giải mã {vn_num(got[0] / 1048576, 0)}/{vn_mb(total, 0)}")
 
-        # ===== BUOC 2: GIAI MA =====
-        _progress(30, "Dang giai ma AES-256...")
-        tar_path = os.path.join(work_dir, "archive.tar.gz")
-        encryption_utils.decrypt_file(encrypted_path, tar_path, user["encryption_key"])
-        _progress(45, f"Giai ma xong: {os.path.getsize(tar_path):,} bytes")
+        def dest_for(name):
+            # Khoi phuc ra thu muc khac: ghi thang _data/... vao dich (khong qua thu muc tam roi chuyen)
+            top, _, rest = name.partition("/")
+            if target_dir and top == "_data" and rest:
+                return None if dry_run else _safe_dest(target_dir, rest)
+            return _safe_dest(extract_dir, name)
 
-        # ===== BUOC 3: GIAI NEN =====
-        _progress(50, "Dang giai nen...")
-        extract_dir = os.path.join(work_dir, "extracted")
-        os.makedirs(extract_dir, exist_ok=True)
-        skip_count, ok_count = _safe_extractall(tar_path, extract_dir)
-        _progress(60, f"Giai nen xong: {ok_count} files OK, {skip_count} files bo qua (path qua dai/bi lock)")
+        try:
+            plain = open_decrypt_stream(_CountingReader(resp.raw, on_bytes), user["encryption_key"])
+            with _open_tar_stream(plain) as tar:
+                n_ok, n_skip = extract_stream(tar, extract_dir, dest_for)
+        finally:
+            resp.close()
+        progress(60, f"Giải nén và xác thực xong: {vn_int(n_ok)} mục" + (f", bỏ qua {n_skip}" if n_skip else ""))
 
-        # ===== BUOC 4: DOC METADATA & SYSTEM STATE =====
-        meta_path = os.path.join(extract_dir, "_meta", "metadata.json")
-        snap_path = os.path.join(extract_dir, "_meta", "snapshot.json")
-        sys_state_path = os.path.join(extract_dir, "_meta", "system_state.json")
-
-        with open(meta_path, "r", encoding="utf-8") as f:
+        # ===== 2. Metadata =====
+        meta_dir = os.path.join(extract_dir, "_meta")
+        with open(os.path.join(meta_dir, "metadata.json"), encoding="utf-8") as f:
             metadata = json.load(f)
-
-        # Thanh phan co trong ban backup nay (ho tro backup chon loc).
-        # Ban backup cu (khong co 'components') -> coi nhu day du.
         components = metadata.get("components")
-        do_files = (components is None) or ("files" in components)
-
-        backup_sys_state = {}
-        if os.path.exists(sys_state_path):
-            with open(sys_state_path, "r", encoding="utf-8") as f:
-                backup_sys_state = json.load(f)
-
-        comp_label = ", ".join(components) if components else "toan bo"
-        _progress(65, f"Backup tu {metadata.get('created_at')} | Thanh phan: {comp_label}")
-
-        # ===== BUOC 5: SO SANH FILE (chi khi backup co thanh phan 'files') =====
-        compare_result = {
-            "missing": [], "extra": [], "modified": [], "same": [],
-            "summary": {"total_backup": 0, "total_current": 0,
-                        "to_add": 0, "to_delete": 0, "to_overwrite": 0, "unchanged": 0},
-        }
+        do_files = components is None or "files" in components
+        backup_state = {}
+        sys_path = os.path.join(meta_dir, "system_state.json")
+        if os.path.exists(sys_path):
+            with open(sys_path, encoding="utf-8") as f:
+                backup_state = json.load(f)
         backup_snap = None
-        current_snap = None
+        snap_path = os.path.join(meta_dir, "snapshot.json")
         if do_files and os.path.exists(snap_path):
-            _progress(70, "Tao snapshot hien tai de so sanh...")
-            backup_snap = snapshot.load_snapshot(snap_path)
-            current_snap = snapshot.create_snapshot(
-                metadata.get("paths", []), exclude_patterns=config.EXCLUDE_PATTERNS
-            )
-            compare_result = snapshot.compare_snapshots(backup_snap, current_snap)
-            summary = compare_result["summary"]
-            _progress(75, f"So sanh xong: them={summary['to_add']}, "
-                          f"xoa={summary['to_delete']}, ghi_de={summary['to_overwrite']}, "
-                          f"giu_nguyen={summary['unchanged']}")
-            print(f"\n  [SO SANH SNAPSHOT]")
-            print(f"  - Backup: {summary['total_backup']} files | Hien tai: {summary['total_current']} files")
-            print(f"  - Them={summary['to_add']} Xoa={summary['to_delete']} "
-                  f"GhiDe={summary['to_overwrite']} GiuNguyen={summary['unchanged']}")
+            with open(snap_path, encoding="utf-8") as f:
+                backup_snap = json.load(f)
+
+        compare_result = {"missing": [], "extra": [], "modified": [], "same": [],
+                          "summary": {"total_backup": 0, "total_current": 0, "to_add": 0,
+                                      "to_delete": 0, "to_overwrite": 0, "unchanged": 0}}
+        data_dir = os.path.join(extract_dir, "_data")
+
+        # ===== 3a. Khoi phuc ra thu muc khac: du lieu da duoc ghi thang vao dich luc giai nen =====
+        if target_dir and backup_snap is not None:
+            progress(65, f"Đã khôi phục {vn_int(len(backup_snap['files']))} file vào {target_dir}")
+            compare_result["summary"].update(total_backup=len(backup_snap["files"]),
+                                             to_add=len(backup_snap["files"]))
+            sys_diffs = []
         else:
-            _progress(75, "Bo qua so sanh file (ban backup khong co thanh phan 'files').")
+            # ===== 3b. So sanh voi hien tai =====
+            current_snap = None
+            if backup_snap is not None:
+                progress(65, "Đang so sánh với dữ liệu hiện tại...")
+                current_snap = create_snapshot(metadata.get("paths", []),
+                                               matcher=ExcludeMatcher.from_config(config),
+                                               reference=backup_snap)
+                compare_result = compare_snapshots(backup_snap, current_snap)
+                s = compare_result["summary"]
+                progress(72, f"So sánh: thêm {s['to_add']}, ghi đè {s['to_overwrite']}, "
+                             f"thừa {s['to_delete']}, giữ nguyên {s['unchanged']}")
+            sys_diffs = []
+            if backup_state and restore_system:
+                current_state = system_state.capture_system_state(backup_state.get("components"))
+                sys_diffs = system_state.compare_system_state(backup_state, current_state)
 
-        # So sanh system state (chi cac thanh phan co trong backup)
-        sys_diffs = []
-        if backup_sys_state:
-            current_sys_state = system_state.capture_system_state()
-            sys_diffs = system_state.compare_system_state(backup_sys_state, current_sys_state)
-            if sys_diffs:
-                print(f"\n  [SYSTEM STATE DIFFS]")
-                for d in sys_diffs:
-                    print(f"  - {d}")
+            if not dry_run:
+                # SQL + Registry (neu co)
+                sql_dir = os.path.join(extract_dir, "_sql")
+                if restore_system and os.path.isdir(sql_dir):
+                    for bak in sorted(f for f in os.listdir(sql_dir) if f.endswith(".bak")):
+                        progress(75, f"Khôi phục CSDL {bak}")
+                        sql_registry.restore_sql_database(os.path.join(sql_dir, bak), os.path.splitext(bak)[0])
+                reg_dir = os.path.join(extract_dir, "_registry")
+                if restore_system and os.path.isdir(reg_dir) and os.listdir(reg_dir):
+                    progress(78, "Khôi phục Windows Registry")
+                    sql_registry.restore_registry(reg_dir)
 
+                if backup_snap is not None and current_snap is not None:
+                    if delete_extra:
+                        progress(80, f"Xoá {len(compare_result['extra'])} file thừa")
+                        for rel in compare_result["extra"]:
+                            p = current_snap["files"][rel]["abs_path"]
+                            try:
+                                os.remove(long_path(p))
+                            except OSError as e:
+                                log.warning("Không xoá được %s: %s", p, e)
+                    todo = compare_result["modified"] + compare_result["missing"]
+                    progress(85, f"Ghi {vn_int(len(todo))} file")
+                    for rel in todo:
+                        info = backup_snap["files"][rel]
+                        src = os.path.join(data_dir, rel)
+                        if not os.path.exists(long_path(src)) or not info.get("abs_path"):
+                            log.warning("Thiếu dữ liệu cho %s trong bản sao lưu", rel)
+                            continue
+                        try:
+                            _place(src, info["abs_path"], info.get("mtime"))
+                        except OSError as e:
+                            log.warning("Không ghi được %s: %s", info["abs_path"], e)
+
+        secs = time.perf_counter() - t0
         if dry_run:
-            _progress(100, "Dry run - khong thuc hien restore")
-            shutil.rmtree(work_dir, ignore_errors=True)
-            return {
-                "success": True, "dry_run": True,
-                "compare_result": compare_result, "system_diffs": sys_diffs,
-                "components": components,
-            }
-
-        # ===== BUOC 6: RESTORE SQL + REGISTRY (neu co trong ban backup) =====
-        sql_dir = os.path.join(extract_dir, "_sql")
-        if os.path.exists(sql_dir):
-            bak_files = [f for f in os.listdir(sql_dir) if f.endswith(".bak")]
-            if bak_files:
-                _progress(76, f"Dang restore {len(bak_files)} SQL database(s)...")
-                for bak_file in bak_files:
-                    sql_registry.restore_sql_database(
-                        os.path.join(sql_dir, bak_file), os.path.splitext(bak_file)[0])
-
-        reg_dir = os.path.join(extract_dir, "_registry")
-        if os.path.exists(reg_dir) and os.listdir(reg_dir):
-            _progress(78, "Dang restore Windows Registry...")
-            sql_registry.restore_registry(reg_dir)
-
-        # ===== BUOC 7: AP DUNG THAY DOI FILE (chi khi co thanh phan 'files') =====
-        if do_files and backup_snap is not None and current_snap is not None:
-            _progress(80, "Dang xoa file du...")
-            for rel in compare_result["extra"]:
-                info = current_snap["files"].get(rel)
-                if info and info.get("abs_path"):
-                    try:
-                        os.remove(info["abs_path"])
-                        print(f"  [XOA] {info['abs_path']}")
-                    except OSError as e:
-                        print(f"  [WARN] Khong xoa duoc {info['abs_path']}: {e}")
-
-            _progress(85, "Dang ghi de file khac noi dung va them file thieu...")
-            data_dir = os.path.join(extract_dir, "_data")
-            for rel in compare_result["modified"] + compare_result["missing"]:
-                backup_info = backup_snap["files"].get(rel)
-                if not backup_info:
-                    continue
-                src = os.path.normpath(os.path.join(data_dir, rel))
-                if not os.path.exists(src):
-                    print(f"  [WARN] File backup khong tim thay: {src}")
-                    continue
-                dst = backup_info.get("abs_path")
-                if not dst:
-                    continue
-                try:
-                    os.makedirs(os.path.dirname(dst), exist_ok=True)
-                    shutil.copy2(src, dst)
-                    action = "GHI DE" if rel in compare_result["modified"] else "THEM"
-                    print(f"  [{action}] {dst}")
-                except OSError as e:
-                    print(f"  [WARN] Khong ghi duoc {dst}: {e}")
+            progress(100, "Chạy thử xong (không thay đổi gì)")
         else:
-            _progress(85, "Bo qua khoi phuc file (ban backup khong co thanh phan 'files').")
+            # Bao 100% TRUOC khi doi mang: doi IP/firewall co the cat ket noi toi server.
+            progress(100, f"Khôi phục xong trong {vn_num(secs)} giây" +
+                     (", đang áp dụng cấu hình hệ thống..." if backup_state and restore_system and not target_dir else ""))
+            if backup_state and restore_system and not target_dir:
+                system_state.restore_system_state(backup_state)
 
-        # Don dep file tam (system state da nam trong RAM nen van restore duoc sau khi xoa)
-        shutil.rmtree(work_dir, ignore_errors=True)
-
-        # ===== BUOC 8: BAO 100% TRUOC KHI RESTORE NETWORK =====
-        # QUAN TRONG: bao 100% TRUOC khi doi IP/firewall vi doi mang se cat ket noi.
-        _progress(100, "RESTORE HOAN TAT! Dang ap dung system state...")
-
-        # ===== BUOC 9: RESTORE SYSTEM STATE (chi thanh phan co trong backup) =====
-        if backup_sys_state:
-            print("[restore] Khoi phuc system state (chi thanh phan da backup)...")
-            system_state.restore_system_state(backup_sys_state)
-            print("[restore] System state da duoc khoi phuc!")
-
-        return {
-            "success": True,
-            "compare_result": compare_result,
-            "system_diffs": sys_diffs,
-            "components": components,
-            "backup_date": metadata.get("created_at"),
-        }
-
-    except Exception as e:
-        shutil.rmtree(work_dir, ignore_errors=True)
-        raise
+        return {"success": True, "dry_run": dry_run, "compare_result": compare_result,
+                "system_diffs": sys_diffs, "components": components,
+                "backup_date": metadata.get("created_at")}
+    finally:
+        shutil.rmtree(long_path(work_dir), ignore_errors=True)

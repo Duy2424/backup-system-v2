@@ -37,6 +37,7 @@ import base64
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -53,24 +54,45 @@ from bench.common import (RESULTS_DIR, append_rows, dir_size, fmt_bytes, hostnam
                           now_iso, print_table, process_read_bytes, setup_console)
 
 
-def _import_v1(work):
-    """Nap module v1 (agent/ + shared/) va chuyen thu muc tam cua v1 vao `work`."""
-    for sub in ("shared", "agent"):
-        p = str(REPO / sub)
-        if p not in sys.path:
-            sys.path.insert(0, p)
-    import config
-    config.BACKUP_TEMP_DIR = str(work / "v1_tmp")
-    config.SNAPSHOTS_DIR = str(work / "v1_snap")
+def _git():
+    return shutil.which("git") or r"C:\Program Files\Git\cmd\git.exe"
+
+
+def _source_dir(ref):
+    """Thu muc ma nguon can do: repo hien tai, hoac git worktree cua `ref` (vd tag v1-goc)."""
+    if not ref:
+        return REPO
+    dest = REPO / "bench" / "work" / f"ref-{re.sub(r'[^A-Za-z0-9_.-]', '_', ref)}"
+    if not (dest / "agent").exists():
+        subprocess.run([_git(), "worktree", "add", "--detach", str(dest), ref], cwd=str(REPO), check=True)
+    return dest
+
+
+def _import_v1(work, src):
+    """Nap module backup cua `src` va chuyen thu muc tam vao `work`. Ho tro ca cau truc cu lan moi."""
+    if (src / "shared" / "__init__.py").exists():           # ban toi uu (package)
+        if str(src) not in sys.path:
+            sys.path.insert(0, str(src))
+        from shared import config
+        from agent import backup_logic
+        config.BACKUP_TEMP_DIR = str(work / "v1_tmp")
+        config.RESTORE_TEMP_DIR = str(work / "v1_restore")
+    else:                                                   # v1 goc (sys.path tung thu muc)
+        for sub in ("shared", "agent"):
+            sys.path.insert(0, str(src / sub))
+        import config
+        import backup_logic
+        config.BACKUP_TEMP_DIR = str(work / "v1_tmp")
+        config.SNAPSHOTS_DIR = str(work / "v1_snap")
+        os.makedirs(config.SNAPSHOTS_DIR, exist_ok=True)
     os.makedirs(config.BACKUP_TEMP_DIR, exist_ok=True)
-    os.makedirs(config.SNAPSHOTS_DIR, exist_ok=True)
-    import backup_logic
     return config, backup_logic
 
 
-def _start_local_server(work):
+def _start_local_server(work, src):
     log = open(work / "v1_server.log", "w", encoding="utf-8")
-    proc = subprocess.Popen([sys.executable, str(REPO / "bench" / "v1_server.py"), "--workdir", str(work)],
+    proc = subprocess.Popen([sys.executable, str(REPO / "bench" / "v1_server.py"), "--workdir", str(work),
+                             "--src", str(src)],
                             stdout=subprocess.PIPE, stderr=log, text=True, cwd=str(REPO))
     line = proc.stdout.readline()
     if not line:
@@ -104,22 +126,27 @@ def main(argv=None):
     ap.add_argument("--server-url", help="dung server v1 co san thay vi tu bat (vd http://100.x.y.z:5000)")
     ap.add_argument("--token", help="X-Auth-Token cua user tren server do (bat buoc khi co --server-url)")
     ap.add_argument("--with-system-state", action="store_true", help="do ca buoc chup system state cua v1")
+    ap.add_argument("--ref", help="do ma nguon cua git ref khac (vd v1-goc = ban do an co so goc)")
+    ap.add_argument("--label", help="ten phien ban ghi vao CSV (mac dinh v1-goc / v1-toiuu)")
     ap.add_argument("--keep", action="store_true", help="giu lai du lieu + kho sau khi do")
     args = ap.parse_args(argv)
     if args.server_url and not args.token:
         ap.error("--server-url can --token")
+    label = args.label or ("v1-goc" if args.ref == "v1-goc" else args.ref or "v1-toiuu")
+    src = _source_dir(args.ref)
 
-    work = Path(args.workdir).resolve() / f"v1-{datetime.now():%Y%m%d-%H%M%S}"
+    work = Path(args.workdir).resolve() / f"{label}-{datetime.now():%Y%m%d-%H%M%S}"
     data = work / "du_lieu"
     work.mkdir(parents=True)
-    print(f"[bench v1] thu muc lam viec: {work}")
-    print(f"[bench v1] sinh du lieu {args.size} seed={args.seed} ...", flush=True)
+    print(f"[bench {label}] ma nguon: {src}")
+    print(f"[bench {label}] thu muc lam viec: {work}")
+    print(f"[bench {label}] sinh du lieu {args.size} seed={args.seed} ...", flush=True)
     ds = make_dataset.generate(data, args.size, args.seed)
-    print(f"[bench v1] {ds['so_file']} file, {fmt_bytes(ds['tong_byte'])}, digest {ds['digest'][:16]}")
+    print(f"[bench {label}] {ds['so_file']} file, {fmt_bytes(ds['tong_byte'])}, digest {ds['digest'][:16]}")
 
-    config, backup_logic = _import_v1(work)
+    config, backup_logic = _import_v1(work, src)
     if not args.with_system_state:
-        backup_logic.system_state.capture_system_state = lambda: {
+        backup_logic.system_state.capture_system_state = lambda *a, **k: {
             "platform": platform.platform(), "hostname": hostname()}
 
     proc = None
@@ -129,10 +156,10 @@ def main(argv=None):
                 "encryption_key": base64.urlsafe_b64encode(os.urandom(32)).decode()}
         req_log, kho_dir, che_do = None, None, f"server={config.SERVER_URL}"
     else:
-        proc, user = _start_local_server(work)
+        proc, user = _start_local_server(work, src)
         config.SERVER_URL = f"http://127.0.0.1:{user['port']}"
         req_log, kho_dir, che_do = work / "v1_requests.jsonl", work / "v1_kho", "server=local"
-    print(f"[bench v1] server v1: {config.SERVER_URL}")
+    print(f"[bench {label}] server v1: {config.SERVER_URL}")
 
     rows, log_off, kho_cong_don = [], 0, 0
     try:
@@ -142,7 +169,7 @@ def main(argv=None):
             else:
                 st = make_dataset.mutate(data, args.mutate, args.seed, round_no=i - 1)
                 mo_ta = f"mutate {args.mutate:g}% vong {i - 1}"
-                print(f"[bench v1] {mo_ta}: {st}")
+                print(f"[bench {label}] {mo_ta}: {st}")
             files = make_dataset.iter_files(data)
             expected, data_bytes = len(files), sum(p.stat().st_size for _, p in files)
 
@@ -168,15 +195,15 @@ def main(argv=None):
                 kho_cong_don += result["size"]
                 kho = kho_cong_don
             rows.append({
-                "thoi_gian": start, "phien_ban": "v1", "lan_chay": i, "giay": f"{secs:.3f}",
+                "thoi_gian": start, "phien_ban": label, "lan_chay": i, "giay": f"{secs:.3f}",
                 "byte_doc": "" if r0 is None else r1 - r0, "byte_gui": byte_gui,
                 "dung_luong_kho": kho, "may": hostname(), "kich_thuoc_du_lieu": data_bytes,
                 "so_file": so_file, "mo_ta": mo_ta,
                 "ghi_chu": (f"seed={args.seed} size={args.size} digest0={ds['digest'][:12]} {che_do} "
                             f"system_state={'co' if args.with_system_state else 'bo_qua'} "
-                            f"bkup={result['filename']}"),
+                            f"ref={args.ref or 'HEAD'} bkup={result['filename']}"),
             })
-            print(f"[bench v1] lan {i} xong: {secs:.2f}s, gui {fmt_bytes(byte_gui)}, kho {fmt_bytes(kho)}",
+            print(f"[bench {label}] lan {i} xong: {secs:.2f}s, gui {fmt_bytes(byte_gui)}, kho {fmt_bytes(kho)}",
                   flush=True)
     finally:
         if proc is not None:
@@ -186,9 +213,9 @@ def main(argv=None):
     append_rows(args.csv, rows)
     print()
     print_table(rows)
-    print(f"\n[bench v1] da ghi {len(rows)} dong vao {args.csv}")
+    print(f"\n[bench {label}] da ghi {len(rows)} dong vao {args.csv}")
     if args.keep:
-        print(f"[bench v1] giu lai {work}")
+        print(f"[bench {label}] giu lai {work}")
     else:
         shutil.rmtree(work, ignore_errors=True)
     return 0

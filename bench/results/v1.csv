@@ -1,4 +1,7 @@
 ﻿thoi_gian,phien_ban,lan_chay,giay,byte_doc,byte_gui,dung_luong_kho,may,kich_thuoc_du_lieu,so_file,mo_ta,ghi_chu
-2026-10-14T11:05:24+07:00,v1,1,53.850,1717807685,339816293,339815868,Duy2424,517508784,5229,full,seed=2026 size=500MB digest0=f0040b2508fa server=local system_state=bo_qua bkup=backup_user1_20261014_110524.bkup
-2026-10-14T11:06:24+07:00,v1,2,62.217,1733959825,341348213,681163656,Duy2424,524491115,5229,mutate 5% vong 1,seed=2026 size=500MB digest0=f0040b2508fa server=local system_state=bo_qua bkup=backup_user1_20261014_110624.bkup
-2026-10-14T11:07:42+07:00,v1,3,71.382,1782849801,352768149,1033931380,Duy2424,537516517,5229,mutate 5% vong 2,seed=2026 size=500MB digest0=f0040b2508fa server=local system_state=bo_qua bkup=backup_user1_20261014_110742.bkup
+2026-10-14T11:05:24+07:00,v1-goc,1,53.850,1717807685,339816293,339815868,Duy2424,517508784,5229,full,seed=2026 size=500MB digest0=f0040b2508fa server=local system_state=bo_qua ref=v1-goc bkup=backup_user1_20261014_110524.bkup
+2026-10-14T11:06:24+07:00,v1-goc,2,62.217,1733959825,341348213,681163656,Duy2424,524491115,5229,mutate 5% vong 1,seed=2026 size=500MB digest0=f0040b2508fa server=local system_state=bo_qua ref=v1-goc bkup=backup_user1_20261014_110624.bkup
+2026-10-14T11:07:42+07:00,v1-goc,3,71.382,1782849801,352768149,1033931380,Duy2424,537516517,5229,mutate 5% vong 2,seed=2026 size=500MB digest0=f0040b2508fa server=local system_state=bo_qua ref=v1-goc bkup=backup_user1_20261014_110742.bkup
+2026-10-14T12:35:20+07:00,v1-toiuu,1,7.466,517530694,338642202,338642202,Duy2424,517508784,5229,full,seed=2026 size=500MB digest0=f0040b2508fa server=local system_state=bo_qua ref=HEAD bkup=backup_bench_20261014_123520.bkup
+2026-10-14T12:35:35+07:00,v1-toiuu,2,9.182,524491115,340152293,678794495,Duy2424,524491115,5229,mutate 5% vong 1,seed=2026 size=500MB digest0=f0040b2508fa server=local system_state=bo_qua ref=HEAD bkup=backup_bench_20261014_123535.bkup
+2026-10-14T12:36:13+07:00,v1-toiuu,3,21.020,537516517,351534656,1030329151,Duy2424,537516517,5229,mutate 5% vong 2,seed=2026 size=500MB digest0=f0040b2508fa server=local system_state=bo_qua ref=HEAD bkup=backup_bench_20261014_123613.bkup

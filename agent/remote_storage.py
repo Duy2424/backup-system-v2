@@ -1,115 +1,76 @@
 """
-Remote Storage Client - chay tren agent (Win 2012)
-Giao tiep voi storage server (Win 2016) qua HTTP de upload/download file backup
+Giao tiep kho tren server (agent goi).
 
-Moi user co folder rieng tren server, dinh danh boi token
+- upload_stream(): gui than request dang chunked tu 1 generator -> khong can file tam,
+  khong nap ca ban backup vao RAM. Server ghi file tam roi doi ten, tra ve sha256.
+- download_stream(): tra ve response dang stream de giai ma ngay khi tai.
+- KHONG co ham xoa: kho chi cho them (chong ransomware).
 """
-# Auto-add shared/ to import path (cho phep import config, database, snapshot, encryption_utils)
-import sys
-import os
-_SHARED = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "shared"))
-if _SHARED not in sys.path:
-    sys.path.insert(0, _SHARED)
+import hashlib
+import logging
 
-import os
 import requests
-import config
+
+log = logging.getLogger("agent.storage")
+
+
+class StorageError(RuntimeError):
+    pass
 
 
 class RemoteStorageClient:
-    """Client de upload/download file len storage server"""
-
-    def __init__(self, server_url, token):
+    def __init__(self, server_url, token, timeout=(10, 300)):
         self.server_url = server_url.rstrip("/")
         self.token = token
+        self.timeout = timeout
         self.session = requests.Session()
-        # Doan timeout dai cho file lon
-        self.upload_timeout = 600  # 10 phut
-        self.download_timeout = 600
+        self.session.headers["X-Auth-Token"] = token
 
-    def _headers(self):
-        return {"X-Auth-Token": self.token}
-
-    def upload(self, local_path, remote_filename, progress_callback=None):
-        """
-        Upload file local len server vao folder cua user.
-        Server se luu vao storage/<user_id>/<remote_filename>
-        """
-        if not os.path.exists(local_path):
-            raise FileNotFoundError(local_path)
-
-        file_size = os.path.getsize(local_path)
-        url = f"{self.server_url}/api/storage/upload"
-
-        # Su dung streaming upload de khong dung het RAM voi file lon
-        with open(local_path, "rb") as f:
-            files = {"file": (remote_filename, f, "application/octet-stream")}
-            data = {"filename": remote_filename, "size": str(file_size)}
-
-            print(f"[storage] Uploading {remote_filename} ({file_size:,} bytes)...")
-            response = self.session.post(
-                url,
-                headers=self._headers(),
-                files=files,
-                data=data,
-                timeout=self.upload_timeout
-            )
-
-        if response.status_code != 200:
-            raise RuntimeError(f"Upload failed: {response.status_code} {response.text}")
-
-        result = response.json()
-        print(f"[storage] Upload OK: {result}")
-        return result
-
-    def download(self, remote_filename, local_path, progress_callback=None):
-        """Tai file backup tu server ve agent"""
-        url = f"{self.server_url}/api/storage/download"
-        params = {"filename": remote_filename}
-
-        print(f"[storage] Downloading {remote_filename} -> {local_path}")
-        with self.session.get(
-            url, headers=self._headers(), params=params,
-            stream=True, timeout=self.download_timeout
-        ) as response:
-            if response.status_code != 200:
-                raise RuntimeError(f"Download failed: {response.status_code} {response.text}")
-
-            total = int(response.headers.get("Content-Length", 0))
-            written = 0
-            os.makedirs(os.path.dirname(local_path), exist_ok=True)
-            with open(local_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=config.CHUNK_SIZE):
-                    if chunk:
-                        f.write(chunk)
-                        written += len(chunk)
-                        if progress_callback and total > 0:
-                            progress_callback(int(written * 100 / total))
-
-        print(f"[storage] Download OK: {written:,} bytes")
-        return local_path
-
-    def list_files(self):
-        """Liet ke cac file trong folder cua user"""
-        url = f"{self.server_url}/api/storage/list"
-        response = self.session.get(url, headers=self._headers(), timeout=30)
-        response.raise_for_status()
-        return response.json()
-
-    def delete(self, remote_filename):
-        """Xoa file backup tren server"""
-        url = f"{self.server_url}/api/storage/delete"
-        response = self.session.post(
-            url, headers=self._headers(),
-            json={"filename": remote_filename}, timeout=30
-        )
-        response.raise_for_status()
-        return response.json()
+    def _url(self, path):
+        return f"{self.server_url}{path}"
 
     def ping(self):
-        """Kiem tra ket noi den server"""
         try:
-            response = self.session.get(f"{self.server_url}/api/ping", timeout=5)
-            return response.status_code == 200
-        except Exception:
+            return self.session.get(self._url("/api/ping"), timeout=5).status_code == 200
+        except requests.RequestException:
             return False
+
+    def upload_stream(self, filename, chunks):
+        """
+        Gui cac khoi bytes tu `chunks` len /api/storage/backups/<filename>.
+        Tra ve {"size", "sha256"} va kiem tra khop voi phia server.
+        """
+        h = hashlib.sha256()
+        sent = [0]
+
+        def body():
+            for c in chunks:
+                if c:
+                    h.update(c)
+                    sent[0] += len(c)
+                    yield c
+
+        r = self.session.put(self._url(f"/api/storage/backups/{filename}"), data=body(),
+                             headers={"Content-Type": "application/octet-stream"}, timeout=self.timeout)
+        if r.status_code not in (200, 201):
+            raise StorageError(f"Upload loi {r.status_code}: {r.text[:300]}")
+        info = r.json()
+        if info.get("sha256") != h.hexdigest() or info.get("size") != sent[0]:
+            raise StorageError("Server nhan khong khop du lieu da gui (sha256/kich thuoc)")
+        log.info("Upload xong %s (%s byte)", filename, f"{sent[0]:,}")
+        return {"size": sent[0], "sha256": h.hexdigest()}
+
+    def download_stream(self, filename):
+        """Response stream (dung .raw de doc). Nho dong lai sau khi dung."""
+        r = self.session.get(self._url(f"/api/storage/backups/{filename}"), stream=True, timeout=self.timeout)
+        if r.status_code != 200:
+            text = r.text[:300]
+            r.close()
+            raise StorageError(f"Tai ve loi {r.status_code}: {text}")
+        r.raw.decode_content = False
+        return r
+
+    def list_files(self):
+        r = self.session.get(self._url("/api/storage/backups"), timeout=30)
+        r.raise_for_status()
+        return r.json()

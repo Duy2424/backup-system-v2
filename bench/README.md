@@ -27,9 +27,14 @@ v1, v2, restic chạy trên cùng dữ liệu.
 .venv\Scripts\python.exe bench\bench_v1.py
 ```
 
-- Bench **tự bật server v1** ở tiến trình riêng (127.0.0.1, cổng ngẫu nhiên, DB và kho nằm trong `bench\work\v1-<giờ>\`).
+- Bench **tự bật server** ở tiến trình riêng (127.0.0.1, cổng ngẫu nhiên, DB và kho nằm trong `bench\work\<nhãn>-<giờ>\`).
   Không cần tự chạy `server.py`, không đụng tới `backup_system.db` hay `storage\` thật.
 - Mặc định: 500 MB, seed 2026, 3 lần (full → mutate 5% → mutate 5%), ghi vào `bench\results\v1.csv`.
+- Hai phiên bản, cột `phien_ban` trong CSV:
+  - `v1-toiuu`: mã nguồn hiện tại (bản 1.5) — `bench\bench_v1.py`
+  - `v1-goc`: bản đồ án cơ sở gốc — `bench\bench_v1.py --ref v1-goc` (tự tạo git worktree của tag `v1-goc`
+    trong `bench\work\ref-v1-goc\`, không đụng tới mã nguồn đang làm).
+- Byte gửi được đếm bằng WSGI middleware ở phía server (đúng cả với upload chunked không có `Content-Length`).
 - Đo qua mạng thật (vd server v1 đặt trên PC, nối bằng Tailscale): bật `server\start_server.bat` trên PC,
   lấy token của user ở trang Admin, rồi chạy
 

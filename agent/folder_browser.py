@@ -1,211 +1,127 @@
 """
-Folder Browser - mini HTTP server chay tren agent
-Cho phep web UI duyet thu muc cua may client (Win 2012)
+Folder browser: HTTP mini tren agent de web UI (qua server) duyet thu muc may agent.
 
-Endpoint:
-- GET /folders/list?path=C:\\  -> liet ke thu muc con va file tai path
-- GET /folders/quick           -> danh sach quick picks (Desktop, Documents...)
+  GET /folders/quick           -> thu muc hay dung + o dia
+  GET /folders/list?path=...   -> thu muc con (va toi da 200 file) tai path
+  GET /folders/ping
 
-Chay nhu thread nen trong agent.py, lang nghe port 5001
+Bao mat (v1 goc nghe 0.0.0.0, khong xac thuc, cho CORS *):
+  - BAT BUOC header X-Auth-Token = token cua agent (server gui kem khi proxy).
+  - Mac dinh chi nghe 127.0.0.1 (agent cung may voi server). Server o may khac thi dat
+    BROWSER_HOST=0.0.0.0 trong agent_config.txt.
 """
-# Auto-add shared/ to import path (cho phep import config, database, snapshot, encryption_utils)
-import sys
-import os
-_SHARED = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "shared"))
-if _SHARED not in sys.path:
-    sys.path.insert(0, _SHARED)
-
+import hmac
+import json
+import logging
 import os
 import platform
-import json
+import string
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
+from shared import config
+
+log = logging.getLogger("agent.browser")
 IS_WINDOWS = platform.system() == "Windows"
-BROWSER_PORT = 5001
+MAX_FILES = 200
 
 
 def get_drives():
-    """Lay danh sach drive co san (C:, D:, ...)"""
     if not IS_WINDOWS:
-        return ["/", "/home", "/tmp"]
-    drives = []
-    import string
-    for letter in string.ascii_uppercase:
-        drive = f"{letter}:\\"
-        if os.path.exists(drive):
-            drives.append(drive)
-    return drives
+        return ["/"]
+    return [f"{c}:\\" for c in string.ascii_uppercase if os.path.exists(f"{c}:\\")]
 
 
 def get_quick_picks():
-    """Danh sach folder thuong dung"""
-    picks = []
     if not IS_WINDOWS:
-        for p in ["/home", "/tmp", "/var/log"]:
-            if os.path.exists(p):
-                picks.append({"name": p, "path": p, "icon": "folder"})
-        return picks
-
-    userprofile = os.environ.get("USERPROFILE", "C:\\Users\\Administrator")
-    candidates = [
-        ("Desktop", os.path.join(userprofile, "Desktop"), "desktop"),
-        ("Documents", os.path.join(userprofile, "Documents"), "file-earmark-text"),
-        ("Downloads", os.path.join(userprofile, "Downloads"), "download"),
-        ("Pictures", os.path.join(userprofile, "Pictures"), "image"),
-        ("User Profile", userprofile, "person"),
-        ("C:\\ Drive", "C:\\", "hdd"),
-        ("Program Files", "C:\\Program Files", "boxes"),
-        ("Program Files (x86)", "C:\\Program Files (x86)", "boxes"),
-    ]
-    for name, path, icon in candidates:
-        if os.path.exists(path):
-            picks.append({"name": name, "path": path, "icon": icon})
-
-    # Them cac drive khac (D:, E:...)
-    for drive in get_drives():
-        if drive != "C:\\":
-            picks.append({"name": f"{drive} Drive", "path": drive, "icon": "hdd"})
+        return [{"name": p, "path": p, "icon": "folder"} for p in ("/home", "/tmp") if os.path.isdir(p)]
+    home = os.environ.get("USERPROFILE", r"C:\Users\Administrator")
+    cands = [("Desktop", os.path.join(home, "Desktop"), "desktop"),
+             ("Documents", os.path.join(home, "Documents"), "doc"),
+             ("Downloads", os.path.join(home, "Downloads"), "download"),
+             ("Pictures", os.path.join(home, "Pictures"), "image"),
+             ("Thư mục người dùng", home, "user"),
+             ("Public", r"C:\Users\Public", "users")]
+    picks = [{"name": n, "path": p, "icon": i} for n, p, i in cands if os.path.isdir(p)]
+    picks += [{"name": f"Ổ {d[0]}:", "path": d, "icon": "drive"} for d in get_drives()]
     return picks
 
 
 def list_directory(path):
-    """
-    Liet ke thu muc con tai path.
-    Tra ve: { current, parent, folders: [{name, path, size}], files: [...] }
-    """
     if not path:
-        # Tra ve root - liet ke cac drive
         if IS_WINDOWS:
-            return {
-                "current": "",
-                "parent": None,
-                "folders": [{"name": d, "path": d, "is_drive": True}
-                            for d in get_drives()],
-                "files": []
-            }
-        else:
-            path = "/"
-
-    # Chuan hoa path
+            return {"current": "", "parent": None, "files": [],
+                    "folders": [{"name": d, "path": d, "is_drive": True} for d in get_drives()]}
+        path = "/"
     path = os.path.normpath(path)
-
-    if not os.path.exists(path):
-        return {"error": f"Path khong ton tai: {path}"}
     if not os.path.isdir(path):
-        return {"error": f"Khong phai thu muc: {path}"}
-
-    folders = []
-    files = []
+        return {"error": f"Không phải thư mục hoặc không tồn tại: {path}"}
+    folders, files = [], []
     try:
-        for entry in os.scandir(path):
-            try:
-                if entry.is_dir(follow_symlinks=False):
-                    folders.append({
-                        "name": entry.name,
-                        "path": entry.path,
-                        "is_drive": False
-                    })
-                elif entry.is_file(follow_symlinks=False):
-                    try:
-                        size = entry.stat().st_size
-                    except OSError:
-                        size = 0
-                    files.append({
-                        "name": entry.name,
-                        "path": entry.path,
-                        "size": size
-                    })
-            except (PermissionError, OSError):
-                continue
+        with os.scandir(path) as it:
+            for e in it:
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        folders.append({"name": e.name, "path": e.path, "is_drive": False})
+                    elif e.is_file(follow_symlinks=False) and len(files) < MAX_FILES:
+                        files.append({"name": e.name, "path": e.path, "size": e.stat().st_size})
+                except OSError:
+                    continue
     except PermissionError:
-        return {"error": "Khong co quyen truy cap thu muc nay"}
+        return {"error": "Không có quyền truy cập thư mục này"}
     except OSError as e:
         return {"error": str(e)}
-
-    # Sap xep alphabetical
     folders.sort(key=lambda x: x["name"].lower())
     files.sort(key=lambda x: x["name"].lower())
-
-    # Parent path
-    parent = os.path.dirname(path.rstrip(os.sep))
-    if IS_WINDOWS and len(path) <= 3:  # Drive root nhu C:\
-        parent = ""  # Quay ve list drives
-
-    return {
-        "current": path,
-        "parent": parent if parent != path else None,
-        "folders": folders,
-        "files": files[:200]  # Gioi han 200 file mot luc
-    }
+    parent = os.path.dirname(path.rstrip("\\/"))
+    if IS_WINDOWS and len(path) <= 3:
+        parent = ""
+    return {"current": path, "parent": parent if parent != path else None, "folders": folders, "files": files}
 
 
 class BrowserHandler(BaseHTTPRequestHandler):
-    """HTTP handler cho folder browser"""
+    server_version = "BackupAgentBrowser/1.5"
 
-    def _send_json(self, data, status=200):
+    def _json(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self):
-        parsed = urlparse(self.path)
-        params = parse_qs(parsed.query)
-
-        if parsed.path == "/folders/list":
-            path = params.get("path", [""])[0]
-            try:
-                self._send_json(list_directory(path))
-            except Exception as e:
-                self._send_json({"error": str(e)}, 500)
-
-        elif parsed.path == "/folders/quick":
-            try:
-                self._send_json({
-                    "quick_picks": get_quick_picks(),
-                    "drives": get_drives(),
-                    "hostname": platform.node()
-                })
-            except Exception as e:
-                self._send_json({"error": str(e)}, 500)
-
-        elif parsed.path == "/folders/ping":
-            self._send_json({"ok": True, "hostname": platform.node()})
-
-        else:
-            self._send_json({"error": "Not found"}, 404)
+        token = self.headers.get("X-Auth-Token", "")
+        if not config.AGENT_TOKEN or not hmac.compare_digest(token, config.AGENT_TOKEN):
+            return self._json({"error": "unauthorized"}, 401)
+        u = urlparse(self.path)
+        try:
+            if u.path == "/folders/list":
+                return self._json(list_directory(parse_qs(u.query).get("path", [""])[0]))
+            if u.path == "/folders/quick":
+                return self._json({"quick_picks": get_quick_picks(), "drives": get_drives(),
+                                   "hostname": platform.node()})
+            if u.path == "/folders/ping":
+                return self._json({"ok": True, "hostname": platform.node()})
+            return self._json({"error": "not_found"}, 404)
+        except Exception as e:      # noqa: BLE001
+            log.exception("Loi folder browser")
+            return self._json({"error": str(e)}, 500)
 
     def log_message(self, fmt, *args):
-        # Tat log mac dinh de khong spam console agent
         pass
 
 
-def start_browser_server():
-    """Khoi dong mini-server trong thread nen"""
-    def _run():
-        try:
-            httpd = HTTPServer(("0.0.0.0", BROWSER_PORT), BrowserHandler)
-            print(f"[folder_browser] Lang nghe tai port {BROWSER_PORT}")
-            httpd.serve_forever()
-        except Exception as e:
-            print(f"[folder_browser] Loi: {e}")
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    return t
-
-
-if __name__ == "__main__":
-    start_browser_server()
-    import time
-    print("Folder browser dang chay. Nhan Ctrl+C de dung.")
+def start_browser_server(host=None, port=None):
+    """Chay trong thread nen. Tra ve server (hoac None neu khong mo duoc cong)."""
+    host, port = host or config.BROWSER_HOST, port or config.BROWSER_PORT
     try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        pass
+        httpd = ThreadingHTTPServer((host, port), BrowserHandler)
+    except OSError as e:
+        log.error("Khong mo duoc folder browser %s:%s - %s", host, port, e)
+        return None
+    threading.Thread(target=httpd.serve_forever, name="folder-browser", daemon=True).start()
+    log.info("Folder browser nghe %s:%s", host, port)
+    return httpd

@@ -1,173 +1,175 @@
 """
-Tao snapshot (manifest) cua file system - dung de:
-1. Backup incremental (chi luu thay doi)
-2. So sanh trang thai luc backup vs luc restore
-3. Phat hien file thieu / du / khac noi dung
+Quet thu muc + snapshot (manifest) + so sanh.
+
+- scan_files(): duyet thu muc 1 lan (os.scandir), loc exclude, ho tro duong dan dai Windows.
+- create_snapshot(): manifest {rel: {abs_path, size, mtime, hash}} - dung khi restore so sanh.
+- compare_snapshots(): thieu / du / khac / giong.
+Hash duoc tinh LUOI: file cung size + cung mtime voi ban backup thi coi la khong doi
+(giong rsync "quick check"), chi bam khi can.
 """
-import os
+import fnmatch
 import hashlib
-import json
+import os
 from datetime import datetime
 
+HASH_BUF = 1024 * 1024
+_IS_WINDOWS = os.name == "nt"
 
-def hash_file(path, chunk_size=65536):
-    """Tinh SHA-256 hash cua file"""
+
+def long_path(p):
+    """Them tien to \\\\?\\ de vuot gioi han 260 ky tu tren Windows."""
+    if not _IS_WINDOWS:
+        return p
+    p = os.path.abspath(p)
+    if p.startswith("\\\\?\\"):
+        return p
+    if p.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + p[2:]
+    return "\\\\?\\" + p
+
+
+def strip_long(p):
+    if p.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + p[8:]
+    if p.startswith("\\\\?\\"):
+        return p[4:]
+    return p
+
+
+class ExcludeMatcher:
+    """So khop glob khong phan biet hoa thuong theo TEN file/thu muc (khong phai chuoi con)."""
+
+    def __init__(self, dir_patterns=(), file_patterns=(), abs_paths=()):
+        self.dirs = [p.lower() for p in dir_patterns]
+        self.files = [p.lower() for p in file_patterns]
+        self.abs = {os.path.normcase(os.path.abspath(p)) for p in abs_paths}
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(config.EXCLUDE_DIRS, config.EXCLUDE_FILES, config.exclude_abs_paths())
+
+    def skip_dir(self, name, path=None):
+        n = name.lower()
+        if any(fnmatch.fnmatchcase(n, p) for p in self.dirs):
+            return True
+        return path is not None and os.path.normcase(strip_long(path)) in self.abs
+
+    def skip_file(self, name):
+        n = name.lower()
+        return any(fnmatch.fnmatchcase(n, p) for p in self.files)
+
+
+def root_names(paths):
+    """Ten goc cho tung duong dan (trung ten -> them ~2, ~3) de rel path khong dung nhau."""
+    seen, out = {}, []
+    for p in paths:
+        base = os.path.basename(os.path.normpath(p)) or os.path.splitdrive(p)[0].rstrip(":") or "root"
+        n = seen.get(base.lower(), 0) + 1
+        seen[base.lower()] = n
+        out.append(base if n == 1 else f"{base}~{n}")
+    return out
+
+
+def scan_files(paths, matcher=None, on_error=None):
+    """
+    Sinh (rel, abs_path, stat) cho moi file thuong. rel = "<ten goc>/<duong dan con>" dang '/'.
+    abs_path la duong dan binh thuong (khong co tien to \\\\?\\).
+    """
+    matcher = matcher or ExcludeMatcher()
+    for base, name in zip(paths, root_names(paths)):
+        if not os.path.exists(base):
+            continue
+        if os.path.isfile(base):
+            try:
+                yield name, os.path.abspath(base), os.stat(long_path(base))
+            except OSError as e:
+                if on_error:
+                    on_error(base, e)
+            continue
+        stack = [(long_path(base), name)]
+        while stack:
+            d, rel_d = stack.pop()
+            try:
+                with os.scandir(d) as it:
+                    entries = sorted(it, key=lambda e: e.name)
+            except OSError as e:
+                if on_error:
+                    on_error(strip_long(d), e)
+                continue
+            subdirs = []
+            for e in entries:
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        if not matcher.skip_dir(e.name, e.path):
+                            subdirs.append((e.path, f"{rel_d}/{e.name}"))
+                    elif e.is_file(follow_symlinks=False):
+                        if not matcher.skip_file(e.name):
+                            yield f"{rel_d}/{e.name}", strip_long(e.path), e.stat(follow_symlinks=False)
+                except OSError as err:
+                    if on_error:
+                        on_error(strip_long(e.path), err)
+            stack.extend(reversed(subdirs))
+
+
+def hash_file(path, chunk_size=HASH_BUF):
+    """SHA-256 hex cua file, None neu khong doc duoc."""
     h = hashlib.sha256()
     try:
-        with open(path, "rb") as f:
-            while True:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    break
-                h.update(chunk)
+        with open(long_path(path), "rb") as f:
+            for block in iter(lambda: f.read(chunk_size), b""):
+                h.update(block)
         return h.hexdigest()
-    except (IOError, PermissionError):
+    except OSError:
         return None
 
 
-def create_snapshot(paths, exclude_patterns=None):
+def create_snapshot(paths, exclude_patterns=None, matcher=None, reference=None):
     """
-    Tao snapshot/manifest cua cac duong dan
-    Tra ve dict: { relative_path: {abs_path, size, mtime, hash} }
+    Manifest cua `paths`. `reference` (snapshot khac): file cung size + mtime voi
+    reference thi lay lai hash cu, khong doc file (nhanh khi restore so sanh).
+    `exclude_patterns` giu de tuong thich: danh sach glob ap cho ca file lan thu muc.
     """
-    exclude_patterns = exclude_patterns or []
-    snapshot = {
-        "created_at": datetime.now().isoformat(),
-        "paths": paths,
-        "files": {}
-    }
-
-    for base_path in paths:
-        if not os.path.exists(base_path):
-            continue
-
-        if os.path.isfile(base_path):
-            rel = os.path.basename(base_path)
-            try:
-                stat = os.stat(base_path)
-                snapshot["files"][rel] = {
-                    "base": base_path,
-                    "abs_path": base_path,
-                    "size": stat.st_size,
-                    "mtime": stat.st_mtime,
-                    "hash": hash_file(base_path),
-                    "is_file": True
-                }
-            except OSError:
-                pass
-            continue
-
-        # Walk directory
-        base_path = os.path.abspath(base_path)
-        base_name = os.path.basename(base_path)
-        for root, dirs, files in os.walk(base_path):
-            # Loai bo thu muc system
-            dirs[:] = [d for d in dirs if not _should_exclude(d, exclude_patterns)]
-
-            for fname in files:
-                if _should_exclude(fname, exclude_patterns):
-                    continue
-                abs_path = os.path.join(root, fname)
-                try:
-                    stat = os.stat(abs_path)
-                except OSError:
-                    continue
-
-                rel_to_base = os.path.relpath(abs_path, base_path)
-                # Su dung "tag" la ten thu muc goc + relative path
-                rel = os.path.join(base_name, rel_to_base).replace("\\", "/")
-
-                snapshot["files"][rel] = {
-                    "base": base_path,
-                    "abs_path": abs_path,
-                    "size": stat.st_size,
-                    "mtime": stat.st_mtime,
-                    "hash": hash_file(abs_path),
-                    "is_file": True
-                }
-
-    snapshot["total_files"] = len(snapshot["files"])
-    snapshot["total_size"] = sum(f.get("size", 0) for f in snapshot["files"].values())
-    return snapshot
+    if matcher is None:
+        pats = exclude_patterns or []
+        matcher = ExcludeMatcher(pats, pats)
+    ref_files = (reference or {}).get("files", {})
+    snap = {"created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "paths": list(paths), "files": {}}
+    for rel, abs_path, st in scan_files(paths, matcher):
+        ref = ref_files.get(rel)
+        if ref and ref.get("size") == st.st_size and _same_mtime(ref.get("mtime"), st.st_mtime):
+            digest = ref.get("hash")
+        else:
+            digest = hash_file(abs_path)
+        snap["files"][rel] = {"abs_path": abs_path, "size": st.st_size,
+                              "mtime": st.st_mtime, "hash": digest}
+    snap["total_files"] = len(snap["files"])
+    snap["total_size"] = sum(f["size"] for f in snap["files"].values())
+    return snap
 
 
-def _should_exclude(name, patterns):
-    """
-    Kiem tra co nen loai tru file/thu muc nay khong.
-    Khop voi: ten chinh xac, substring, hoac extension (.tmp, .log...)
-    """
-    name_lower = name.lower()
-    for p in patterns:
-        p_lower = p.lower()
-        # Khop chinh xac (case-insensitive)
-        if name_lower == p_lower:
-            return True
-        # Khop extension (.tmp, .etl, ...)
-        if p_lower.startswith(".") and name_lower.endswith(p_lower):
-            return True
-        # Khop prefix (~$ cho file Office lock)
-        if p_lower.startswith("~") and name_lower.startswith(p_lower.lstrip("~")):
-            if name_lower.startswith("~"):
-                return True
-        # Khop substring (cho path dai nhu Google\Chrome...)
-        if p in name or p_lower in name_lower:
-            return True
-    return False
+def _same_mtime(a, b):
+    return a is not None and abs(float(a) - float(b)) < 1e-3
 
 
 def compare_snapshots(backup_snap, current_snap):
     """
-    So sanh 2 snapshot:
-    - missing: file co trong backup nhung khong co hien tai (can them lai)
-    - extra: file co hien tai nhung khong co trong backup (can xoa)
-    - modified: file ton tai ca 2 nhung khac hash (can ghi de)
-    - same: file giong nhau (khong can lam gi)
+    missing  : co trong backup, hien tai khong co -> them lai
+    extra    : hien tai co, backup khong co        -> (tuy chon) xoa
+    modified : co ca 2 nhung khac noi dung         -> ghi de
+    same     : giong nhau
     """
-    backup_files = set(backup_snap["files"].keys())
-    current_files = set(current_snap["files"].keys())
-
-    missing = backup_files - current_files
-    extra = current_files - backup_files
-    common = backup_files & current_files
-
-    modified = set()
-    same = set()
-    for f in common:
-        b_hash = backup_snap["files"][f].get("hash")
-        c_hash = current_snap["files"][f].get("hash")
-        if b_hash != c_hash:
-            modified.add(f)
+    b, c = backup_snap["files"], current_snap["files"]
+    missing = sorted(set(b) - set(c))
+    extra = sorted(set(c) - set(b))
+    modified, same = [], []
+    for rel in sorted(set(b) & set(c)):
+        if b[rel].get("size") != c[rel].get("size") or b[rel].get("hash") != c[rel].get("hash"):
+            modified.append(rel)
         else:
-            same.add(f)
-
+            same.append(rel)
     return {
-        "missing": list(missing),
-        "extra": list(extra),
-        "modified": list(modified),
-        "same": list(same),
-        "summary": {
-            "total_backup": len(backup_files),
-            "total_current": len(current_files),
-            "to_add": len(missing),
-            "to_delete": len(extra),
-            "to_overwrite": len(modified),
-            "unchanged": len(same)
-        }
+        "missing": missing, "extra": extra, "modified": modified, "same": same,
+        "summary": {"total_backup": len(b), "total_current": len(c), "to_add": len(missing),
+                    "to_delete": len(extra), "to_overwrite": len(modified), "unchanged": len(same)},
     }
-
-
-def save_snapshot(snapshot, path):
-    """Luu snapshot ra file JSON"""
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(snapshot, f, indent=2, ensure_ascii=False)
-
-
-def load_snapshot(path):
-    """Doc snapshot tu file JSON"""
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-if __name__ == "__main__":
-    snap = create_snapshot(["/tmp"])
-    print(f"Total files: {snap['total_files']}, Total size: {snap['total_size']}")

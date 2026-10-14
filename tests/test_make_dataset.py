@@ -80,25 +80,43 @@ def test_mutate_tat_dinh_va_co_thay_doi(ds_a, tmp_path):
     assert md.dataset_digest(y) != d_x
 
 
-def test_ten_file_khong_bi_bo_loc_v1_loai(ds_a):
-    """Bo loc exclude cua v1 khop CHUOI CON (vd 'AC' loai moi ten co 'ac').
-    Neu du lieu mau dinh bo loc, v1 se bo sot file va so do v1/v2 sai."""
-    repo = Path(__file__).resolve().parents[1]
-    sys.path.insert(0, str(repo / "shared"))
-    try:
-        import config
-        import snapshot
-    finally:
-        sys.path.remove(str(repo / "shared"))
+# Bo loc exclude cua v1 GOC (tag v1-goc: shared/config.py + shared/snapshot.py), chep nguyen logic.
+# Khop CHUOI CON (vd "AC" loai moi ten co "ac"). Ban toi uu da sua, nhung bench --ref v1-goc
+# van chay code goc nen du lieu mau phai tranh duoc bo loc nay.
+V1_GOC_PATTERNS = [
+    "__pycache__", ".git", "node_modules", "work", "storage", "Temp", "temp", "TMP", "tmp",
+    "LocalLow", "INetCache", "INetCookies", "Temporary Internet Files", "CryptnetUrlCache", "PackageCache",
+    "$Recycle.Bin", "$RECYCLE.BIN", "Windows.old", "MSOCache", "System Volume Information", "Cache", "CachedData",
+    "Packages", "PackageCache", "LocalState", "AC", "Wer", "CrashDumps", "SquirrelTemp", "npm-cache", "pip", "pip3",
+    ".vs", ".tmp", ".TMP", ".temp", "~$", "pagefile.sys", "hiberfil.sys", "swapfile.sys", "Thumbs.db", "desktop.ini",
+    "backup_system.db", "agent_config.txt", ".etl", "NTUSER.DAT", "ntuser.dat", "ntuser.dat.LOG1", "ntuser.dat.LOG2",
+    "UsrClass.dat", "UsrClass.dat.LOG1", "UsrClass.dat.LOG2", ".LOG1", ".LOG2", ".regtrans-ms", ".evtx",
+]
+
+
+def v1_goc_should_exclude(name, patterns=V1_GOC_PATTERNS):
+    low = name.lower()
+    for p in patterns:
+        pl = p.lower()
+        if low == pl or (pl.startswith(".") and low.endswith(pl)):
+            return True
+        if pl.startswith("~") and low.startswith(pl.lstrip("~")) and low.startswith("~"):
+            return True
+        if p in name or pl in low:
+            return True
+    return False
+
+
+def test_ten_file_khong_bi_bo_loc_v1_goc_loai(ds_a):
+    """Neu du lieu mau dinh bo loc cua v1 goc, v1 se bo sot file va so do v1/v2 sai."""
+    assert v1_goc_should_exclude("contract.docx")          # chung minh loi cua v1 goc
     root, _ = ds_a
     names = set()
     for rel, _ in md.iter_files(root):
         names.update(rel.split("/"))
-    bi_loai = sorted(n for n in names if snapshot._should_exclude(n, config.EXCLUDE_PATTERNS))
-    assert bi_loai == []
-    # mau ten cua file them moi khi mutate cung phai an toan
+    assert sorted(n for n in names if v1_goc_should_exclude(n)) == []
     for n in ("them_v1_0001.txt", "them_v2_0003.docx") + tuple(md.PHONG_BAN):
-        assert not snapshot._should_exclude(n, config.EXCLUDE_PATTERNS)
+        assert not v1_goc_should_exclude(n)
 
 
 def test_khong_ghi_de_thu_muc_co_san(tmp_path):

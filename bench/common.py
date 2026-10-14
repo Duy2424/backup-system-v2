@@ -131,10 +131,10 @@ def append_rows(csv_path, rows):
 
 def print_table(rows):
     """In bang ket qua gon cho terminal."""
-    head = f"{'ban':<4} {'lan':>3} {'mo ta':<22} {'giay':>8} {'byte doc':>11} {'byte gui':>11} {'kho':>11} {'so file':>7}"
+    head = f"{'ban':<9} {'lan':>3} {'mo ta':<22} {'giay':>8} {'byte doc':>11} {'byte gui':>11} {'kho':>11} {'so file':>7}"
     print(head)
     print("-" * len(head))
     for r in rows:
-        print(f"{r['phien_ban']:<4} {r['lan_chay']:>3} {r['mo_ta']:<22} {float(r['giay']):>8.2f} "
+        print(f"{r['phien_ban']:<9} {r['lan_chay']:>3} {r['mo_ta']:<22} {float(r['giay']):>8.2f} "
               f"{fmt_bytes(r['byte_doc'] if r['byte_doc'] != '' else None):>11} "
               f"{fmt_bytes(r['byte_gui']):>11} {fmt_bytes(r['dung_luong_kho']):>11} {r['so_file']:>7}")

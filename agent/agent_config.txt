@@ -1,18 +1,20 @@
 # ============================================================
-#  CAU HINH AGENT  -  may client (Win Server 2012 R2)
+#  CAU HINH AGENT
 # ============================================================
-#  File nay duoc shared/config.py doc tu dong (tim 2 dong:
-#  SERVER_URL= ... va AGENT_TOKEN= ...). Chi can sua 2 dong duoi.
+#  Lay 2 dong SERVER_URL va AGENT_TOKEN o trang web:
+#    Cai dat > Ket noi agent > "Chep cau hinh"
+#  roi dan de len 2 dong duoi day.
 #
-#  - SERVER_URL : dia chi may Storage Server (Win Server 2016).
-#                 Theo bao cao, dai mang Host-only la 192.168.10.0/24,
-#                 server chay o 192.168.10.1 cong 5000.
+#  SERVER_URL  : dia chi server.
+#                Agent cung may voi server (PC o nha): http://127.0.0.1:5000
+#                Agent o may khac: http://<IP Tailscale cua PC>:5000
+#  AGENT_TOKEN : token cua tai khoan (KHONG chia se, KHONG dua len git).
 #
-#  - AGENT_TOKEN: token xac thuc cua user (gui kem header X-Auth-Token).
-#                 Lay token nay o trang Admin tren web UI
-#                 (cot "Token" cua tung user). De trong se khong goi
-#                 duoc API (server tra ve 401 Unauthorized).
+#  Tuy chon:
+#  BROWSER_HOST: dia chi nghe cua trinh duyet thu muc (mac dinh 127.0.0.1).
+#                Chi doi thanh 0.0.0.0 khi server o may KHAC voi agent.
+#  POLL_INTERVAL: so giay giua 2 lan hoi server (mac dinh 3).
 # ============================================================
 
-SERVER_URL=http://192.168.10.1:5000
+SERVER_URL=http://127.0.0.1:5000
 AGENT_TOKEN=

@@ -1,206 +1,116 @@
 # Giải pháp Backup toàn diện và hiệu quả cho doanh nghiệp
 
-> Đồ án cơ sở — Chuyên ngành Mạng máy tính — Trường Đại học Công nghệ TP.HCM (HUTECH)
-> SVTH: **Đỗ Hồng Anh Duy** — MSSV: 2380603083 — Lớp: 23DTHC3 — GVHD: Nguyễn Văn Cẩn
+> Đồ án chuyên ngành — Chuyên ngành Mạng máy tính — Trường Đại học Công nghệ TP.HCM (HUTECH)
+> Phát triển tiếp từ đồ án cơ sở của Đỗ Hồng Anh Duy (MSSV 2380603083, lớp 23DTHC3, GVHD Nguyễn Văn Cẩn).
 
-Hệ thống sao lưu (backup) và khôi phục (restore) theo mô hình **Client–Server** chạy trên mạng LAN nội bộ, dành cho doanh nghiệp nhỏ. Điểm khác biệt so với các công cụ thông thường: ngoài file người dùng, hệ thống còn sao lưu và phục hồi **toàn bộ cấu hình mạng và hệ thống của Windows Server** — phần thường bị bỏ qua nhưng lại mất nhiều thời gian nhất khi dựng lại máy chủ.
+Hệ thống sao lưu và khôi phục mô hình **server – agent** cho doanh nghiệp nhỏ. Ngoài file người dùng, hệ thống còn sao lưu
+và khôi phục **cấu hình mạng và hệ thống Windows** (IPv4/IPv6, tường lửa, route, hosts, SMB share, portproxy, Defender,
+SQL Server, Registry) — phần thường bị bỏ qua nhưng tốn thời gian nhất khi dựng lại máy chủ.
 
-> **Gói này gồm đầy đủ cả hai phía:** `server/` (Storage Server) và `agent/` (máy client), cùng `shared/` dùng chung và bộ script test. Triển khai thật cần 2 máy (xem [Cách chạy](#cách-chạy)).
-
----
-
-## Tính năng chính
-
-- **Sao lưu toàn diện**: file người dùng + 6 thành phần cấu hình mạng + SQL Server + Windows Registry.
-  - 6 thành phần mạng: card mạng IPv4/IPv6, Windows Firewall (3 profile), Routing Table & Persistent Route, file Hosts, SMB Network Shares, Port Proxy.
-- **Mã hóa AES-256 (CBC)** dạng streaming — mỗi user một khóa riêng (sinh từ Fernet rồi suy ra qua SHA-256), IV ngẫu nhiên cho mỗi lần mã hóa.
-- **Snapshot SHA-256** — băm từng file để phát hiện thay đổi (thiếu / dư / sửa / giữ nguyên), giúp restore an toàn theo delta.
-- **Nén tar.gz** mức 6, cân bằng giữa tốc độ và dung lượng.
-- **Xác thực bằng token** qua header `X-Auth-Token` cho REST API; mỗi user chỉ truy cập dữ liệu của mình.
-- **Lập lịch tự động** (hourly / daily / weekly) bằng luồng chạy nền (`server/scheduler.py`): đến hạn sẽ tự tạo job backup cho agent.
-- **Giao diện web** (Flask + Bootstrap 5): dashboard, quản trị user, lập lịch, trình duyệt thư mục (folder picker), progress bar thời gian thực.
+Bản hiện tại là **1.5 (v1 tối ưu)**, nền cho bản v2 (chia mẩu + khử trùng lặp, xem [`docs/repo-format.md`](docs/repo-format.md)).
+Bản đồ án cơ sở gốc giữ ở tag `v1-goc` (dùng để đo so sánh: `python bench\bench_v1.py --ref v1-goc`).
 
 ---
 
-## Kiến trúc
+## Mô hình triển khai
 
 ```
-        ┌─────────────────────────────┐         HTTP / REST          ┌──────────────────────────────┐
-        │  STORAGE SERVER             │   Polling 3s + X-Auth-Token   │  AGENT (CLIENT)              │
-        │  Windows Server 2016        │ <───────────────────────────  │  Windows Server 2012 R2     │
-        │  192.168.10.1 : 5000        │                               │  192.168.10.2 : 5001        │
-        │  Flask Web + REST API       │                               │  Backup / Restore           │
-        │  SQLite + Scheduler         │  ──────────────────────────>  │  Folder Browser             │
-        └─────────────────────────────┘     upload / download .bkup   └──────────────────────────────┘
-                     LAN VMware Host-only — dải 192.168.10.0/24
+ Laptop (chỉ điều khiển)                     PC ở nhà (xử lý mọi thứ)
+ ┌──────────────────────┐   Tailscale      ┌────────────────────────────────────────────┐
+ │ Trình duyệt          │ ───────────────► │ server  : web điều khiển + REST API + kho    │
+ │ http://100.x.y.z:5000│   (WireGuard)    │ agent   : sao lưu/khôi phục dữ liệu & cấu hình│
+ └──────────────────────┘                  │           SQL Server, SMB share, IIS...      │
+                                           └────────────────────────────────────────────┘
 ```
 
-- **Server (Win Server 2016)**: web UI, REST API, CSDL SQLite, bộ lập lịch, kho lưu file backup theo từng user.
-- **Agent (Win Server 2012 R2)**: cứ 3 giây gọi `/api/jobs/poll` hỏi job mới, rồi thực hiện backup/restore và báo tiến độ; chạy thêm Folder Browser (cổng 5001) phục vụ folder picker trên web.
+- **PC**: chạy `server` và `agent`. Kho file backup nằm trên PC (bản sao bất biến lên cloud ở tuần 5).
+- **Laptop**: không cài gì, chỉ mở trình duyệt tới IP Tailscale của PC. Giao diện chạy offline (không CDN, không font ngoài).
+- Agent có thể chạy thêm trên máy khác: đặt `SERVER_URL` trỏ về PC.
 
----
+## Cài đặt (trên PC)
 
-## Công nghệ sử dụng
+Yêu cầu: Windows 10/11 hoặc Windows Server, **Python 3.11**.
 
-| Thành phần | Phiên bản |
-|---|---|
-| Python | 3.11 |
-| Flask | 3.0.0 |
-| Werkzeug | 3.0.1 |
-| Requests | 2.31.0 |
-| cryptography | 42.0.5 |
-| CSDL | SQLite (tích hợp sẵn trong Python) |
-| Giao diện | Bootstrap 5 (CDN) |
-
-(Phiên bản pin đúng theo `requirements.txt`.)
-
----
-
-## Cài đặt
-
-Yêu cầu: Windows Server (hoặc Windows) có **Python 3.11** trên **cả hai máy**, chạy bằng quyền **Administrator**.
-
-Cách nhanh nhất — chạy `install.bat` (tự thử cài online, nếu không có mạng thì chuyển sang cài offline từ thư mục `wheels`). Hoặc cài thủ công:
-
-```bash
-pip install -r requirements.txt
+```bat
+install.bat
 ```
 
-> **Môi trường LAN Host-only không có Internet:** ở máy có mạng chạy `download_wheels.bat` để tải sẵn các wheel vào thư mục `wheels/`, copy sang máy đích rồi chạy `install.bat` (nó tự cài offline bằng `pip install --no-index --find-links wheels`).
->
-> **Giao diện web nạp Bootstrap 5 qua CDN.** Nếu máy server không ra được Internet, tải `bootstrap.min.css` + `bootstrap.bundle.min.js` + bộ `bootstrap-icons` về `server/templates/` (hoặc `static/`) và sửa lại đường link trong `server/templates/base.html`.
+`install.bat` tạo môi trường `.venv` và cài đúng phiên bản trong `requirements.txt` (máy không có Internet: chạy
+`download_wheels.bat` ở máy có mạng rồi chép thư mục `wheels\` sang).
 
----
+## Chạy
 
-## Cách chạy
+1. **Server** — `server\start_server.bat` (hoặc `.venv\Scripts\python -m server`).
+   Lần đầu, mật khẩu `admin` được sinh ngẫu nhiên, in ra cửa sổ và lưu ở `instance\admin_password.txt`.
+   Đăng nhập, đổi mật khẩu ở **Cài đặt**, rồi xoá file đó.
+2. **Agent** — trên web vào **Cài đặt → Kết nối agent → Chép cấu hình**, dán vào `agent\agent_config.txt`,
+   rồi chạy `agent\start_agent.bat` **bằng quyền Administrator** (khôi phục IP/tường lửa cần quyền này).
+3. **Từ laptop** — mở `http://<IP Tailscale của PC>:5000`.
 
-### 1. Máy Server (Windows Server 2016 — 192.168.10.1)
+Biến môi trường tuỳ chọn (đặt trên PC):
 
-Chạy `server/start_server.bat`, hoặc:
-
-```bash
-cd server
-python server.py
-```
-
-Khi khởi động, server tự tạo CSDL (4 bảng: `users`, `backups`, `jobs`, `schedules`) và bật luồng scheduler. Mở trình duyệt: `http://192.168.10.1:5000`
-
-Tài khoản mặc định:
-
-| Username | Password | Vai trò |
+| Biến | Ý nghĩa | Mặc định |
 |---|---|---|
-| `admin` | `admin123` | Admin |
-| `user1` | `user123` | User |
+| `BACKUP_HOST` / `BACKUP_PORT` | Địa chỉ nghe của server | `0.0.0.0` / `5000` |
+| `BACKUP_ADMIN_PASSWORD` | Mật khẩu admin lần khởi tạo đầu | sinh ngẫu nhiên |
+| `BACKUP_SECRET_KEY` | Khoá phiên đăng nhập | sinh ngẫu nhiên, lưu `instance\secret_key` |
+| `BACKUP_COOKIE_SECURE=1` | Bật khi truy cập qua HTTPS (vd sau Caddy) | tắt |
+| `BACKUP_STORAGE_DIR`, `BACKUP_DB`, `BACKUP_WORK_DIR` | Đổi chỗ lưu kho / CSDL / file tạm | trong thư mục repo |
 
-Vào trang **Quản trị user**, copy **Token** của user để dùng cho agent.
+Tường lửa: chỉ mở cổng 5000 trên card Tailscale, không mở ra Internet.
 
-### 2. Máy Agent (Windows Server 2012 R2 — 192.168.10.2)
+## Bản 1.5 khác gì bản gốc
 
-Mở `agent/agent_config.txt`, điền token vào dòng `AGENT_TOKEN=`:
+| | v1 gốc (`v1-goc`) | 1.5 |
+|---|---|---|
+| Đọc dữ liệu | băm 1 lượt + nén 1 lượt + đọc lại tar + đọc lại `.bkup` | **1 lượt** (băm, nén, mã hoá cùng lúc) |
+| Gửi lên server | multipart, nạp cả file vào RAM | stream chunked, RAM cố định ~16 MB, không file tạm |
+| Nén | gzip mức 6 (1 luồng) | zstd mức 3 (đa luồng) |
+| Mã hoá | AES-256-CBC, **không xác thực** | AES-256-GCM theo đoạn 1 MiB: sửa/cắt file → phát hiện |
+| Chụp cấu hình hệ thống | ~8 tiến trình PowerShell, 41 s (đo trên laptop) | 1 tiến trình, 8,4 s, xuất UTF-8 |
+| Khôi phục | luôn xoá file thừa, băm lại mọi file | xoá file thừa là tuỳ chọn; so nhanh theo size+mtime; chạy thử; khôi phục ra thư mục khác |
+| Mật khẩu | SHA-256 + salt | scrypt (tài khoản cũ tự nâng cấp khi đăng nhập) |
+| API | token user A lấy được job + khoá mã hoá của user B; có lệnh xoá file backup | job tách theo user; **không có lệnh xoá**, không ghi đè |
+| Web | Bootstrap qua CDN, tải lại trang | SPA không cần build, chạy offline, tiến độ trực tiếp, CSRF, giới hạn đăng nhập sai |
 
-```
-SERVER_URL=http://192.168.10.1:5000
-AGENT_TOKEN=<token-cua-user>
-```
+Số đo trên cùng bộ dữ liệu 500 MB (`bench/results/v1.csv`, laptop Ryzen 7 3750H):
+bản gốc 53,9 s / 62,2 s / 71,4 s, bản 1.5 7,5 s / 9,2 s / 21,0 s (full / sau 5% thay đổi / sau 5% nữa).
+Cả hai vẫn gửi lại toàn bộ mỗi lần (~324 MB) — giảm phần này là việc của v2.
 
-Rồi chạy `agent/start_agent.bat`, hoặc:
+Tương thích: file `.bkup` cũ (CBC + gzip) vẫn khôi phục được; CSDL cũ tự nâng cấp khi server khởi động.
+Nếu dùng lại CSDL cũ, tài khoản mặc định `admin/admin123`, `user1/user123` vẫn còn — **đổi mật khẩu ngay**.
 
-```bash
-cd agent
-python agent.py
-```
+## Kiểm thử và đo đạc
 
-Agent sẽ polling server mỗi 3 giây và mở Folder Browser ở cổng 5001.
-
-### 3. Sao lưu / khôi phục
-
-Trên web: bấm **"Backup toàn bộ"** (hoặc dùng *Browse Folder* chọn thư mục) → agent tự nhận job và thực hiện. Muốn khôi phục thì bấm **Restore** ở dòng backup tương ứng. Tab **Lịch backup** cho phép tạo lịch hourly/daily/weekly để scheduler tự chạy.
-
----
-
-## Các module agent (máy client)
-
-`agent/` gồm: polling job + điều phối (`agent.py`); đóng gói/nén/mã hóa/upload (`backup_logic.py`); tải về/giải mã/so delta/khôi phục (`restore_logic.py`); capture/restore trạng thái hệ thống (`system_state.py`, `network_advanced.py`); SQL Server + Registry (`sql_registry.py`); folder browser cổng 5001 (`folder_browser.py`); và giao tiếp lưu trữ với server (`remote_storage.py`). Logic mã hóa AES-256 CBC và snapshot SHA-256 nằm ở `shared/encryption_utils.py` và `shared/snapshot.py` (agent gọi lúc đóng gói/khôi phục). Thư mục `agent/sample_data/` chứa dữ liệu mẫu để test nhanh.
-
----
-
-## Kiểm thử restore
-
-Thư mục [`test-scripts/`](test-scripts/) chứa script kiểm tra khôi phục từng thành phần mạng.
-
-- **Test nhanh (1 lần nhấn):** `check_all.bat` xem trạng thái cả 8 thành phần (chỉ hiển thị); `doi_all.bat` đổi cả 8 thành phần (tự xin quyền Administrator). Quy trình: `check_all` → bấm **Backup** trên web → `doi_all` → bấm **Restore** → `check_all` lại.
-- **Test từng phần:** 9 cặp `check_*` / `doi_*`.
-
-Quy trình tổng quát:
-
-```
-check_* (xem trạng thái gốc)  →  Backup trên web  →  doi_* (đổi trạng thái)
-   →  Restore trên web  →  check_* (xác nhận đã về trạng thái gốc)
+```bat
+.venv\Scripts\python -m pytest -q
+.venv\Scripts\python bench\bench_v1.py                 rem đo bản hiện tại (500 MB, 3 lần)
+.venv\Scripts\python bench\bench_v1.py --ref v1-goc    rem đo bản đồ án cơ sở gốc
 ```
 
-Chi tiết xem [`test-scripts/README_TEST.txt`](test-scripts/README_TEST.txt). Các file `doi_*` cần chạy bằng quyền Administrator.
-
----
+Chi tiết: [`bench/README.md`](bench/README.md). Thử VSS trên PC: [`docs/vss-test.md`](docs/vss-test.md).
+Thử khôi phục cấu hình mạng: thư mục [`test-scripts/`](test-scripts/) (`check_all.bat` → sao lưu → `doi_all.bat` → khôi phục → `check_all.bat`).
 
 ## Cấu trúc thư mục
 
 ```
 backup-system/
-├── server/                      # Storage Server (Win Server 2016)
-│   ├── server.py                # Web UI + REST API cho agent
-│   ├── scheduler.py             # Lập lịch backup tự động (luồng chạy nền)
-│   ├── start_server.bat         # Chạy nhanh server
-│   └── templates/               # Giao diện web (Jinja2 + Bootstrap 5)
-│       ├── base.html            # Layout chung (navbar, flash, CSS)
-│       ├── login.html           # Trang đăng nhập
-│       ├── dashboard.html       # Dashboard: backup/restore, folder picker, progress
-│       ├── admin_users.html     # Quản trị user (CRUD + token cho agent)
-│       └── schedules.html       # Quản lý lịch backup
-├── agent/                       # Agent (Win Server 2012 R2)
-│   ├── agent.py                 # Polling job mỗi 3s + điều phối backup/restore
-│   ├── backup_logic.py          # Snapshot → nén → mã hóa → upload
-│   ├── restore_logic.py         # Download → giải mã → so delta → khôi phục
-│   ├── system_state.py          # Capture/restore IPv4, IPv6, hosts...
-│   ├── network_advanced.py      # Firewall (export/import .wfw), routing, port proxy
-│   ├── sql_registry.py          # Backup SQL Server + Windows Registry
-│   ├── folder_browser.py        # HTTP server cổng 5001 cho folder picker
-│   ├── remote_storage.py        # Upload/download file .bkup với server
-│   ├── start_agent.bat          # Chạy nhanh agent
-│   ├── agent_config.txt         # SERVER_URL + AGENT_TOKEN
-│   └── sample_data/             # Dữ liệu mẫu để test
-├── shared/                      # Dùng chung server & agent
-│   ├── config.py                # Cấu hình (đường dẫn, IP, exclude, đọc agent_config.txt)
-│   ├── database.py              # SQLite: users / backups / jobs / schedules
-│   ├── encryption_utils.py      # AES-256 CBC (mã hóa/giải mã file, streaming)
-│   └── snapshot.py              # SHA-256 snapshot + so sánh delta
-├── test-scripts/                # Script test restore từng thành phần mạng
-│   ├── README_TEST.txt
-│   ├── check_all.bat            # Xem trạng thái cả 8 thành phần - 1 lần nhấn
-│   ├── doi_all.bat              # Đổi cả 8 thành phần - 1 lần nhấn (tự xin admin)
-│   ├── check_1..9_*.bat         # Xem trạng thái từng phần
-│   └── doi_1..9_*.bat           # Đổi trạng thái từng phần (quyền Administrator)
-├── install.bat                  # Cài thư viện (thử online, fallback offline)
-├── download_wheels.bat          # Tải sẵn wheel để cài offline
-├── requirements.txt
-├── resolve_conflicts.py         # Tiện ích gỡ merge conflict (giữ nhánh HEAD)
-├── .gitignore
-├── LICENSE
-├── README.md
-├── README_FIXES.txt             # Ghi chú sửa lỗi & đồng bộ với báo cáo
-└── KHOI_PHUC_AGENT.txt          # Ghi chú khôi phục agent (có thể xóa sau khi đã ổn)
+├── server/            server.py (app + API), scheduler.py, static/ (CSS/JS giao diện), templates/app.html
+├── agent/             agent.py (vòng poll), backup_logic.py, restore_logic.py, system_state.py,
+│                      network_advanced.py, sql_registry.py, folder_browser.py, remote_storage.py, winexec.py
+├── shared/            config.py, database.py, encryption_utils.py, snapshot.py, log.py, text.py
+├── bench/             make_dataset.py, bench_v1.py, results/*.csv
+├── tests/             pytest
+├── docs/              repo-format.md (hợp đồng kho v2), vss-test.md, PRODUCT.md, lich-su/
+├── scripts/           vss_test.ps1
+├── test-scripts/      .bat đổi/kiểm tra cấu hình mạng để thử khôi phục
+├── install.bat, download_wheels.bat, requirements.txt
 ```
 
----
+## Hạn chế và hướng phát triển
 
-## Hạn chế & hướng phát triển
+- Mỗi lần vẫn là bản đầy đủ → v2: chia mẩu FastCDC, chỉ gửi mẩu mới, khoá mã hoá giữ ở client.
+- Kho nằm trên chính PC → tuần 5: bản sao bất biến (Object Lock) lên cloud.
+- Server dùng HTTP trong Tailscale (đã mã hoá bởi WireGuard) → tuần 3: Caddy mTLS.
 
-- Hiện chạy trong LAN, chưa hỗ trợ HTTPS và sao lưu offsite/đám mây.
-- Mỗi lần sao lưu toàn bộ (full) — chưa làm incremental thật sự.
-- Agent xử lý tuần tự một job tại một thời điểm.
-- Folder Browser đang hiển thị toàn bộ ổ đĩa của agent — nên giới hạn theo whitelist.
-
-Hướng phát triển: thêm HTTPS, sao lưu tăng dần + deduplication, hỗ trợ nhiều agent song song, lưu trữ lên đám mây theo quy tắc 3-2-1.
-
----
-
-*Đồ án phục vụ mục đích học tập. Triển khai thực tế cần bổ sung HTTPS và sao lưu chính cơ sở dữ liệu chứa khóa mã hóa.*
+*Đồ án phục vụ mục đích học tập.*

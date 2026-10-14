@@ -1,659 +1,752 @@
 """
-Web Server - chay tren Windows Server 2016
-Chuc nang:
-- Web UI cho user login, backup, restore, xem lich su
-- Admin UI quan ly user (CRUD)
-- REST API cho agent (poll job, upload/download file backup) - co xac thuc X-Auth-Token
-- Storage: moi user co folder rieng storage/<user_id>/
+Server (trong do an: PC o nha) - web dieu khien + REST API cho agent + kho file backup.
 
-Chay: python server.py
-Mac dinh lang nghe 0.0.0.0:5000
+Laptop chi can mo trinh duyet toi http://<IP Tailscale cua PC>:5000 de dieu khien.
+
+  /                     giao dien web (SPA, file tinh trong server/static, khong CDN)
+  /api/ui/*             API cho giao dien: phien dang nhap (cookie) + header X-CSRF-Token
+  /api/jobs/*, /api/storage/*   API cho agent: header X-Auth-Token
+  Kho chi cho THEM: khong co lenh xoa file backup, khong ghi de.
+
+Chay:  python -m server            (hoac server\\start_server.bat)
 """
-# Auto-add shared/ to import path (cho phep import config, database, snapshot, encryption_utils)
-import sys
-import os
-_SHARED = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "shared"))
-if _SHARED not in sys.path:
-    sys.path.insert(0, _SHARED)
-
+import hashlib
+import hmac
 import json
-from datetime import datetime
+import logging
+import os
+import platform
+import re
+import secrets
+import shutil
+import sys
+import threading
+import time
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 
-from flask import (
-    Flask, render_template, request, redirect, url_for,
-    session, jsonify, send_file, abort, flash
-)
-from werkzeug.utils import secure_filename
+if __package__ in (None, ""):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import config
-import database
-import scheduler
-import requests as _requests
+import requests  # noqa: E402
+from flask import Flask, g, jsonify, render_template, request, send_file, session  # noqa: E402
 
+from shared import config, database  # noqa: E402
+from shared.log import setup_logging  # noqa: E402
+from server import scheduler  # noqa: E402
 
-app = Flask(__name__)
-app.secret_key = config.SECRET_KEY
-app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024 * 1024  # 10GB
+log = logging.getLogger("server")
 
-# ===== HELPERS =====
-
-def login_required(f):
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        if "user_id" not in session:
-            return redirect(url_for("login"))
-        return f(*args, **kwargs)
-    return wrapper
+FILENAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,120}\.bkup$")
+WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+JOB_STATUSES = {"running", "completed", "failed", "cancelled"}
+TERMINAL = {"completed", "failed", "cancelled"}
+STREAM_BUF = 1024 * 1024
 
 
-def admin_required(f):
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        if "user_id" not in session:
-            return redirect(url_for("login"))
-        if session.get("role") != "admin":
-            flash("Ban khong co quyen truy cap.", "danger")
-            return redirect(url_for("dashboard"))
-        return f(*args, **kwargs)
-    return wrapper
+class ApiError(Exception):
+    def __init__(self, status, message, code=None):
+        super().__init__(message)
+        self.status, self.message, self.code = status, message, code or "error"
 
 
-def current_user():
-    if "user_id" not in session:
+# ===================================================================== tien ich
+
+def _secret_key():
+    if config.SECRET_KEY:
+        return config.SECRET_KEY
+    path = os.path.join(config.INSTANCE_DIR, "secret_key")
+    try:
+        with open(path, encoding="ascii") as f:
+            key = f.read().strip()
+            if key:
+                return key
+    except OSError:
+        pass
+    key = secrets.token_hex(32)
+    os.makedirs(config.INSTANCE_DIR, exist_ok=True)
+    with open(path, "w", encoding="ascii") as f:
+        f.write(key)
+    return key
+
+
+def ts(v):
+    """Chuan hoa moc thoi gian ve ISO 8601 co mui gio (du lieu cu cua v1 lan lon UTC/gio may)."""
+    if not v:
         return None
-    return database.get_user_by_id(session["user_id"])
+    s = str(v)
+    try:
+        if "T" not in s:      # CURRENT_TIMESTAMP cua SQLite = UTC
+            return datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).isoformat()
+        d = datetime.fromisoformat(s)
+        return (d if d.tzinfo else d.astimezone()).isoformat(timespec="seconds")
+    except ValueError:
+        return s
 
 
-def user_storage_dir(user_id):
-    """Folder rieng cua moi user tren server"""
-    d = os.path.join(config.STORAGE_DIR, f"user_{user_id}")
+def _loads(v, default=None):
+    try:
+        return json.loads(v) if v else default
+    except (TypeError, ValueError):
+        return default
+
+
+def job_out(j):
+    p = _loads(j.get("params"), {}) or {}
+    return {"id": j["id"], "type": j["job_type"], "status": j["status"], "progress": j.get("progress") or 0,
+            "message": j.get("message") or "", "backup_id": j.get("backup_id"),
+            "created_at": ts(j.get("created_at")), "started_at": ts(j.get("started_at")),
+            "completed_at": ts(j.get("completed_at")), "updated_at": ts(j.get("updated_at")),
+            "cancel_requested": bool(j.get("cancel_requested")),
+            "params": {k: p[k] for k in ("components", "paths", "filename", "dry_run", "delete_extra",
+                                         "target_dir", "restore_system", "schedule_id") if k in p}}
+
+
+def backup_out(b):
+    ss = _loads(b.get("snapshot_summary"), {}) or {}
+    return {"id": b["id"], "filename": b["filename"], "size": b.get("size") or 0, "status": b["status"],
+            "created_at": ts(b.get("created_at")), "backup_type": b.get("backup_type"),
+            "components": ss.get("components") or [], "files": ss.get("total_files"),
+            "source_bytes": ss.get("total_size"), "paths": _loads(b.get("paths"), []) or [],
+            "stats": _loads(b.get("stats"), {}) or {}}
+
+
+def schedule_out(s):
+    p = scheduler.job_params(s)
+    return {"id": s["id"], "name": s["name"], "schedule_type": s["schedule_type"],
+            "interval_hours": s.get("interval_hours"), "time_of_day": s.get("time_of_day"),
+            "day_of_week": s.get("day_of_week"), "enabled": bool(s.get("enabled")),
+            "paths": p["paths"] or [], "components": p["components"] or list(config.BACKUP_COMPONENTS),
+            "last_run": ts(s.get("last_run")), "next_run": ts(s.get("next_run"))}
+
+
+def agent_out(a):
+    online = False
+    try:
+        seen = datetime.fromisoformat(a["last_seen"])
+        online = (datetime.now(seen.tzinfo) - seen).total_seconds() < config.AGENT_ONLINE_SECONDS
+    except (TypeError, ValueError, KeyError):
+        pass
+    return {"hostname": a["hostname"], "ip": a.get("ip"), "version": a.get("version"),
+            "platform": a.get("platform"), "last_seen": ts(a.get("last_seen")), "online": online,
+            "current_job": a.get("current_job")}
+
+
+def user_out(u, with_token=False):
+    out = {"id": u["id"], "username": u["username"], "role": u["role"], "created_at": ts(u.get("created_at"))}
+    if with_token:
+        out["token"] = u["token"]
+    return out
+
+
+def _body():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        raise ApiError(400, "Dữ liệu gửi lên không hợp lệ (cần JSON)", "bad_json")
+    return data
+
+
+def _components(value):
+    comps = [c for c in (value or []) if c in config.BACKUP_COMPONENTS]
+    if not comps:
+        raise ApiError(400, "Chọn ít nhất một thành phần", "no_components")
+    return comps
+
+
+def _paths(value):
+    if value in (None, "", []):
+        return None
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list) or len(value) > 20 or not all(isinstance(p, str) and 0 < len(p) < 1024
+                                                                   for p in value):
+        raise ApiError(400, "Danh sách thư mục không hợp lệ", "bad_paths")
+    return [p.strip() for p in value]
+
+
+def _reject_duplicate(user_id, job_type, params):
+    """Bam 2 lan / gui lai cung 1 yeu cau -> khong tao them job giong het dang cho/chay."""
+    with database.get_db() as conn:
+        rows = conn.execute("SELECT params FROM jobs WHERE user_id=? AND job_type=? AND status IN ('pending','running')",
+                            (user_id, job_type)).fetchall()
+    for r in rows:
+        if (_loads(r["params"], {}) or {}) == params:
+            raise ApiError(409, "Tác vụ giống hệt đang chờ hoặc đang chạy", "duplicate")
+
+
+def user_dir(user_id):
+    d = os.path.join(config.STORAGE_DIR, f"user_{int(user_id)}")
     os.makedirs(d, exist_ok=True)
     return d
 
 
-def get_user_from_token():
-    """Lay user tu header X-Auth-Token (dung cho API agent)"""
-    token = request.headers.get("X-Auth-Token")
-    if not token:
-        return None
-    return database.get_user_by_token(token)
+class LoginLimiter:
+    """Sai mat khau 5 lan -> khoa IP 60 giay."""
+
+    def __init__(self, max_fails=5, lock_seconds=60):
+        self.max_fails, self.lock_seconds = max_fails, lock_seconds
+        self.state, self.lock = {}, threading.Lock()
+
+    def blocked(self, ip):
+        with self.lock:
+            fails, until = self.state.get(ip, (0, 0))
+            return max(0, int(until - time.time()))
+
+    def fail(self, ip):
+        with self.lock:
+            fails, _ = self.state.get(ip, (0, 0))
+            fails += 1
+            until = time.time() + self.lock_seconds if fails >= self.max_fails else 0
+            self.state[ip] = (0 if until else fails, until)
+
+    def ok(self, ip):
+        with self.lock:
+            self.state.pop(ip, None)
 
 
-def api_auth_required(f):
-    """
-    Decorator xac thuc cho REST API cua agent.
-    Moi request tu agent phai mang header X-Auth-Token hop le.
-    (Khop voi mo ta trong bao cao: "moi Request mang day du thong tin
-     xac thuc thong qua header X-Auth-Token")
-    """
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        user = get_user_from_token()
+# ===================================================================== app
+
+def create_app(start_scheduler=False):
+    config.ensure_dirs()
+    app = Flask(__name__, static_folder="static", template_folder="templates")
+    app.config.update(
+        SECRET_KEY=_secret_key(), SESSION_COOKIE_NAME="bks_session", SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax", SESSION_COOKIE_SECURE=config.COOKIE_SECURE,
+        PERMANENT_SESSION_LIFETIME=timedelta(hours=12), MAX_CONTENT_LENGTH=None,
+        SEND_FILE_MAX_AGE_DEFAULT=0)
+    app.json.ensure_ascii = False
+    limiter = LoginLimiter()
+
+    created_pw = database.init_db()
+    if created_pw:
+        pw_file = os.path.join(config.INSTANCE_DIR, "admin_password.txt")
+        with open(pw_file, "w", encoding="utf-8") as f:
+            f.write(f"admin / {created_pw}\n")
+        log.warning("=" * 60)
+        log.warning("Tạo tài khoản quản trị lần đầu: admin / %s", created_pw)
+        log.warning("(đã lưu ở %s - đổi mật khẩu rồi xoá file này)", pw_file)
+        log.warning("=" * 60)
+
+    # ---------------------------------------------------------------- loi + header
+    @app.errorhandler(ApiError)
+    def _api_error(e):
+        return jsonify({"error": e.code, "message": e.message}), e.status
+
+    @app.errorhandler(404)
+    def _not_found(e):
+        if request.path.startswith("/api/"):
+            return jsonify({"error": "not_found", "message": "Không tìm thấy"}), 404
+        return e
+
+    @app.errorhandler(405)
+    def _not_allowed(e):
+        return jsonify({"error": "method_not_allowed", "message": "Phương thức không được phép"}), 405
+
+    @app.after_request
+    def _headers(resp):
+        resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+        resp.headers.setdefault("X-Frame-Options", "DENY")
+        resp.headers.setdefault("Referrer-Policy", "same-origin")
+        resp.headers.setdefault("Content-Security-Policy",
+                                "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; "
+                                "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+        if request.path.startswith("/api/"):
+            resp.headers.setdefault("Cache-Control", "no-store")
+        return resp
+
+    # ---------------------------------------------------------------- xac thuc UI
+    def ui_auth(admin=False):
+        def deco(f):
+            @wraps(f)
+            def wrapper(*a, **kw):
+                uid = session.get("uid")
+                user = database.get_user_by_id(uid) if uid else None
+                if not user or session.get("pw") != user["password"][-16:]:
+                    session.clear()
+                    raise ApiError(401, "Phiên đăng nhập đã hết, hãy đăng nhập lại", "unauthorized")
+                if request.method in WRITE_METHODS:
+                    sent = request.headers.get("X-CSRF-Token", "")
+                    if not hmac.compare_digest(sent, session.get("csrf", "")):
+                        raise ApiError(403, "Thiếu hoặc sai mã CSRF, hãy tải lại trang", "csrf")
+                if admin and user["role"] != "admin":
+                    raise ApiError(403, "Chỉ quản trị viên được làm việc này", "forbidden")
+                g.user = user
+                return f(*a, **kw)
+            return wrapper
+        return deco
+
+    def agent_auth(f):
+        @wraps(f)
+        def wrapper(*a, **kw):
+            user = database.get_user_by_token(request.headers.get("X-Auth-Token", ""))
+            if not user:
+                raise ApiError(401, "Token không hợp lệ", "unauthorized")
+            g.agent_user = user
+            return f(*a, **kw)
+        return wrapper
+
+    def _touch_agent(current_job=None):
+        h = request.headers
+        port = h.get("X-Agent-Browser-Port", "")
+        database.touch_agent(g.agent_user["id"], (h.get("X-Agent-Host") or request.remote_addr)[:100],
+                             request.remote_addr, h.get("X-Agent-Version", "")[:20] or None,
+                             h.get("X-Agent-Platform", "")[:120] or None,
+                             int(port) if port.isdigit() else None, current_job)
+
+    # ---------------------------------------------------------------- trang
+    @app.get("/")
+    def index():
+        return render_template("app.html", version=config.VERSION)
+
+    @app.get("/api/ping")
+    def api_ping():
+        return jsonify({"ok": True, "time": database.now_iso(), "version": config.VERSION})
+
+    # ---------------------------------------------------------------- phien
+    def _session_payload(user):
+        return {"user": user_out(user), "csrf": session["csrf"], "version": config.VERSION,
+                "components": config.BACKUP_COMPONENTS, "default_paths": config.DEFAULT_BACKUP_PATHS}
+
+    @app.get("/api/ui/session")
+    def ui_session():
+        uid = session.get("uid")
+        user = database.get_user_by_id(uid) if uid else None
+        if not user or session.get("pw") != user["password"][-16:]:
+            raise ApiError(401, "Chưa đăng nhập", "unauthorized")
+        return jsonify(_session_payload(user))
+
+    @app.post("/api/ui/login")
+    def ui_login():
+        ip = request.remote_addr or "?"
+        wait = limiter.blocked(ip)
+        if wait:
+            raise ApiError(429, f"Sai quá nhiều lần, thử lại sau {wait} giây", "rate_limited")
+        data = _body()
+        user = database.authenticate(str(data.get("username", "")).strip(), str(data.get("password", "")))
         if not user:
-            return jsonify({"error": "unauthorized"}), 401
-        request._api_user = user
-        return f(*args, **kwargs)
-    return wrapper
-
-
-# ===== WEB UI ROUTES =====
-
-@app.route("/")
-def index():
-    if "user_id" in session:
-        return redirect(url_for("dashboard"))
-    return redirect(url_for("login"))
-
-
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "")
-        user = database.get_user_by_username(username)
-        if user and database.verify_password(password, user["password"]):
-            session["user_id"] = user["id"]
-            session["username"] = user["username"]
-            session["role"] = user["role"]
-            flash(f"Xin chao {user['username']}!", "success")
-            return redirect(url_for("dashboard"))
-        flash("Sai username hoac password.", "danger")
-    return render_template("login.html")
-
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for("login"))
-
-
-@app.route("/dashboard")
-@login_required
-def dashboard():
-    user = current_user()
-    backups = database.list_backups(user["id"])
-    # Doc danh sach thanh phan da backup (luu trong snapshot_summary) de hien badge
-    for b in backups:
-        comps = []
-        try:
-            ss = json.loads(b.get("snapshot_summary") or "{}")
-            comps = ss.get("components") or []
-        except Exception:
-            comps = []
-        b["components"] = comps
-    jobs = database.list_jobs(user["id"], limit=10)
-    # Thong ke
-    stats = {
-        "total_backups": len(backups),
-        "total_size": sum(b.get("size") or 0 for b in backups),
-        "last_backup": backups[0]["created_at"] if backups else None
-    }
-    return render_template("dashboard.html",
-                           user=user, backups=backups, jobs=jobs, stats=stats)
-
-
-@app.route("/backup", methods=["POST"])
-@login_required
-def start_backup():
-    """User chon thanh phan can backup -> tao job cho agent.
-    Form gui: components=ipv4,firewall,files... va path=<thu muc> (neu chon 'files').
-    Tick het = backup toan bo. Tuong thich nguoc voi form cu (type=full/selected)."""
-    user = current_user()
-
-    raw = request.form.get("components", "")
-    components = [c.strip() for c in raw.split(",") if c.strip() in config.BACKUP_COMPONENTS]
-    selected_path = request.form.get("path", "").strip()
-
-    # Tuong thich nguoc form cu (type=full / type=selected)
-    btype = request.form.get("type", "")
-    if not components:
-        if btype == "selected" and selected_path:
-            components = ["files"]
-        else:
-            components = list(config.BACKUP_COMPONENTS)  # mac dinh: toan bo
-
-    params = {"components": components}
-    if "files" in components and selected_path:
-        params["paths"] = [selected_path]
-    else:
-        params["paths"] = None
-
-    job_id = database.create_job(user["id"], "backup", params)
-    is_full = set(components) >= set(config.BACKUP_COMPONENTS)
-    if is_full:
-        flash(f"Da tao job backup #{job_id} (toan bo). Agent se thuc hien trong vai giay...", "info")
-    else:
-        flash(f"Da tao job backup #{job_id} (chon loc: {', '.join(components)}). "
-              f"Agent se thuc hien trong vai giay...", "info")
-    return redirect(url_for("dashboard"))
-
-
-@app.route("/restore/<int:backup_id>", methods=["POST"])
-@login_required
-def start_restore(backup_id):
-    """User click restore tu backup nao do"""
-    user = current_user()
-    backup = database.get_backup(backup_id)
-    if not backup or backup["user_id"] != user["id"]:
-        flash("Backup khong ton tai.", "danger")
-        return redirect(url_for("dashboard"))
-    if backup["status"] != "completed":
-        flash("Backup chua hoan tat, khong the restore.", "warning")
-        return redirect(url_for("dashboard"))
-
-    job_id = database.create_job(
-        user["id"], "restore",
-        params={"filename": backup["filename"]},
-        backup_id=backup_id
-    )
-    flash(f"Da tao job restore #{job_id} tu backup '{backup['filename']}'.", "info")
-    return redirect(url_for("dashboard"))
-
-
-@app.route("/job/<int:job_id>/status")
-@login_required
-def job_status(job_id):
-    """API trang thai job (de UI poll)"""
-    user = current_user()
-    job = database.get_job(job_id)
-    if not job or (job["user_id"] != user["id"] and user["role"] != "admin"):
-        return jsonify({"error": "not_found"}), 404
-    return jsonify(job)
-
-
-@app.route("/jobs/recent")
-@login_required
-def jobs_recent():
-    """API lay jobs gan day cho UI auto-refresh"""
-    user = current_user()
-    jobs = database.list_jobs(user["id"], limit=5)
-    return jsonify(jobs)
-
-
-# ===== ADMIN ROUTES =====
-
-@app.route("/admin/users")
-@admin_required
-def admin_users():
-    users = database.list_users()
-    return render_template("admin_users.html", users=users)
-
-
-@app.route("/admin/users/add", methods=["POST"])
-@admin_required
-def admin_add_user():
-    username = request.form.get("username", "").strip()
-    password = request.form.get("password", "")
-    role = request.form.get("role", "user")
-    if not username or not password:
-        flash("Thieu username hoac password.", "danger")
-        return redirect(url_for("admin_users"))
-    if database.get_user_by_username(username):
-        flash(f"Username '{username}' da ton tai.", "danger")
-        return redirect(url_for("admin_users"))
-    try:
-        database.create_user(username, password, role)
-        flash(f"Da tao user '{username}'.", "success")
-    except Exception as e:
-        flash(f"Loi: {e}", "danger")
-    return redirect(url_for("admin_users"))
-
-
-@app.route("/admin/users/<int:user_id>/edit", methods=["POST"])
-@admin_required
-def admin_edit_user(user_id):
-    username = request.form.get("username", "").strip() or None
-    password = request.form.get("password", "") or None
-    role = request.form.get("role", "") or None
-    try:
-        database.update_user(user_id, username=username, password=password, role=role)
-        flash("Da cap nhat user.", "success")
-    except Exception as e:
-        flash(f"Loi: {e}", "danger")
-    return redirect(url_for("admin_users"))
-
-
-@app.route("/admin/users/<int:user_id>/delete", methods=["POST"])
-@admin_required
-def admin_delete_user(user_id):
-    if user_id == session["user_id"]:
-        flash("Khong the tu xoa minh.", "danger")
-        return redirect(url_for("admin_users"))
-    database.delete_user(user_id)
-    flash("Da xoa user.", "success")
-    return redirect(url_for("admin_users"))
-
-
-# ===== API CHO AGENT =====
-
-@app.route("/api/ping")
-def api_ping():
-    return jsonify({"ok": True, "time": datetime.now().isoformat()})
-
-
-@app.route("/api/jobs/poll")
-@api_auth_required
-def api_poll_job():
-    """
-    Agent goi de poll job. Phai mang header X-Auth-Token hop le.
-    Tu dong ghi nho IP agent de proxy folder browse.
-    """
-    # Ghi nho IP agent (qua remote_addr) cho folder browser proxy
-    try:
-        _last_agent_ip["ip"] = request.remote_addr
-    except Exception:
-        pass
-
-    job = database.get_next_job()
-    if not job:
-        return jsonify({"job": None})
-
-    # Lay them thong tin user de agent thuc hien backup/restore.
-    # Chi tra nhung truong agent thuc su can.
-    user = database.get_user_by_id(job["user_id"])
-    job["_user"] = {
-        "id": user["id"],
-        "username": user["username"],
-        "token": user["token"],
-        "encryption_key": user["encryption_key"]
-    }
-    if job.get("params"):
-        try:
-            job["params"] = json.loads(job["params"])
-        except Exception:
-            job["params"] = {}
-    return jsonify({"job": job})
-
-
-@app.route("/api/jobs/<int:job_id>/update", methods=["POST", "PATCH"])
-@api_auth_required
-def api_update_job(job_id):
-    """Agent bao tien do va trang thai job.
-    Chap nhan ca POST (Bang 2.3) va PATCH (Bang 2.2) trong bao cao."""
-    data = request.json or {}
-    updates = {}
-    for k in ["status", "progress", "message"]:
-        if k in data:
-            updates[k] = data[k]
-    if "completed" in data and data["completed"]:
-        updates["completed_at"] = datetime.now().isoformat()
-    if updates:
-        database.update_job(job_id, **updates)
-    return jsonify({"ok": True})
-
-
-@app.route("/api/jobs/<int:job_id>/backup_done", methods=["POST"])
-@api_auth_required
-def api_backup_done(job_id):
-    """Agent bao da backup xong - tao record trong bang backups"""
-    data = request.json or {}
-    job = database.get_job(job_id)
-    if not job:
-        return jsonify({"error": "job_not_found"}), 404
-
-    backup_id = database.create_backup_record(
-        user_id=job["user_id"],
-        filename=data.get("filename"),
-        paths=data.get("paths", []),
-        backup_type=data.get("backup_type", "full")
-    )
-    # Luu danh sach thanh phan da backup vao snapshot_summary (de dashboard hien thi
-    # va de biet ban backup nay gom nhung gi).
-    ss = data.get("snapshot_summary", {}) or {}
-    if "components" not in ss and data.get("components") is not None:
-        ss["components"] = data.get("components")
-    database.update_backup(
-        backup_id,
-        size=data.get("size", 0),
-        snapshot_summary=json.dumps(ss),
-        status="completed"
-    )
-    database.update_job(job_id, backup_id=backup_id)
-    return jsonify({"ok": True, "backup_id": backup_id})
-
-
-@app.route("/api/jobs/create", methods=["POST"])
-@api_auth_required
-def api_create_job():
-    """Tao job backup moi qua REST (xac thuc bang X-Auth-Token).
-    Khop Bang 2.2 bao cao: POST /api/jobs/create -> Tao job backup moi.
-    Ho tro chon thanh phan: body co the gui {"components": [...], "type": "selected", "paths": [...]}."""
-    user = request._api_user
-    data = request.json or {}
-    backup_type = data.get("type", "full")
-    paths = data.get("paths")
-    components = data.get("components")
-    if isinstance(components, list):
-        components = [c for c in components if c in config.BACKUP_COMPONENTS] or list(config.BACKUP_COMPONENTS)
-    else:
-        components = list(config.BACKUP_COMPONENTS)
-    params = {"components": components}
-    if "files" in components and backup_type == "selected" and paths:
-        params["paths"] = paths if isinstance(paths, list) else [paths]
-    else:
-        params["paths"] = None
-    job_id = database.create_job(user["id"], "backup", params)
-    return jsonify({"ok": True, "job_id": job_id})
-
-
-@app.route("/api/backups")
-@api_auth_required
-def api_backups():
-    """Lay danh sach backup cua chinh user (xac thuc bang X-Auth-Token).
-    Khop Bang 2.2 bao cao: GET /api/backups -> Lay danh sach backup cua user."""
-    user = request._api_user
-    return jsonify({"backups": database.list_backups(user["id"])})
-
-
-@app.route("/api/users/<int:user_id>", methods=["DELETE"])
-@api_auth_required
-def api_delete_user(user_id):
-    """Admin xoa tai khoan user qua REST (DELETE).
-    Khop Bang 2.2 bao cao: DELETE /api/users/{id} -> Admin xoa tai khoan user.
-    Yeu cau token cua tai khoan co quyen admin."""
-    actor = request._api_user
-    if actor.get("role") != "admin":
-        return jsonify({"error": "forbidden"}), 403
-    if user_id == actor["id"]:
-        return jsonify({"error": "cannot_delete_self"}), 400
-    if not database.get_user_by_id(user_id):
-        return jsonify({"error": "not_found"}), 404
-    database.delete_user(user_id)
-    return jsonify({"ok": True})
-
-
-# ===== STORAGE API (Agent upload/download file backup) =====
-
-@app.route("/api/storage/upload", methods=["POST"])
-def api_storage_upload():
-    """Agent upload file backup vao folder cua user"""
-    user = get_user_from_token()
-    if not user:
-        return jsonify({"error": "unauthorized"}), 401
-
-    if "file" not in request.files:
-        return jsonify({"error": "no_file"}), 400
-
-    f = request.files["file"]
-    filename = secure_filename(request.form.get("filename") or f.filename)
-    if not filename:
-        return jsonify({"error": "bad_filename"}), 400
-
-    user_dir = user_storage_dir(user["id"])
-    save_path = os.path.join(user_dir, filename)
-
-    # Save streaming
-    f.save(save_path)
-    size = os.path.getsize(save_path)
-
-    print(f"[upload] user={user['username']} file={filename} size={size:,}")
-    return jsonify({
-        "ok": True,
-        "path": f"user_{user['id']}/{filename}",
-        "size": size
-    })
-
-
-@app.route("/api/storage/download")
-def api_storage_download():
-    """Agent download file backup"""
-    user = get_user_from_token()
-    if not user:
-        return jsonify({"error": "unauthorized"}), 401
-
-    filename = secure_filename(request.args.get("filename", ""))
-    if not filename:
-        return jsonify({"error": "bad_filename"}), 400
-
-    user_dir = user_storage_dir(user["id"])
-    file_path = os.path.join(user_dir, filename)
-    if not os.path.exists(file_path):
-        return jsonify({"error": "not_found"}), 404
-
-    return send_file(file_path, as_attachment=True, download_name=filename)
-
-
-@app.route("/api/storage/list")
-def api_storage_list():
-    user = get_user_from_token()
-    if not user:
-        return jsonify({"error": "unauthorized"}), 401
-    user_dir = user_storage_dir(user["id"])
-    files = []
-    for name in os.listdir(user_dir):
-        path = os.path.join(user_dir, name)
-        if os.path.isfile(path):
-            files.append({
-                "filename": name,
-                "size": os.path.getsize(path),
-                "modified": datetime.fromtimestamp(os.path.getmtime(path)).isoformat()
-            })
-    return jsonify({"files": files})
-
-
-@app.route("/api/storage/delete", methods=["POST"])
-def api_storage_delete():
-    user = get_user_from_token()
-    if not user:
-        return jsonify({"error": "unauthorized"}), 401
-    data = request.json or {}
-    filename = secure_filename(data.get("filename", ""))
-    if not filename:
-        return jsonify({"error": "bad_filename"}), 400
-    user_dir = user_storage_dir(user["id"])
-    path = os.path.join(user_dir, filename)
-    if os.path.exists(path):
-        os.remove(path)
+            limiter.fail(ip)
+            raise ApiError(401, "Sai tên đăng nhập hoặc mật khẩu", "bad_credentials")
+        limiter.ok(ip)
+        user = database.get_user_by_id(user["id"])
+        session.clear()
+        session.permanent = True
+        session.update(uid=user["id"], csrf=secrets.token_urlsafe(24), pw=user["password"][-16:])
+        log.info("Đăng nhập: %s từ %s", user["username"], ip)
+        return jsonify(_session_payload(user))
+
+    @app.post("/api/ui/logout")
+    def ui_logout():
+        session.clear()
         return jsonify({"ok": True})
-    return jsonify({"error": "not_found"}), 404
+
+    # ---------------------------------------------------------------- tong quan
+    @app.get("/api/ui/overview")
+    @ui_auth()
+    def ui_overview():
+        uid = g.user["id"]
+        st = database.backup_stats(uid)
+        active = database.active_job(uid)
+        scheds = [s for s in scheduler.list_schedules(uid) if s["enabled"] and s.get("next_run")]
+        nxt = min(scheds, key=lambda s: s["next_run"]) if scheds else None
+        try:
+            du = shutil.disk_usage(config.STORAGE_DIR)
+            disk = {"total": du.total, "free": du.free}
+        except OSError:
+            disk = None
+        return jsonify({
+            "stats": {"total_backups": st["total_backups"], "total_size": st["total_size"],
+                      "last_backup": backup_out(st["last_backup"]) if st["last_backup"] else None},
+            "active_job": job_out(active) if active else None,
+            "agents": [agent_out(a) for a in database.list_agents(uid)],
+            "jobs": [job_out(j) for j in database.list_jobs(uid, 8)],
+            "backups": [backup_out(b) for b in database.list_backups(uid, 5)],
+            "next_schedule": schedule_out(nxt) if nxt else None,
+            "disk": disk, "server_time": database.now_iso(),
+        })
+
+    # ---------------------------------------------------------------- backup / restore
+    @app.get("/api/ui/backups")
+    @ui_auth()
+    def ui_backups():
+        return jsonify({"backups": [backup_out(b) for b in database.list_backups(g.user["id"])]})
+
+    @app.post("/api/ui/backups")
+    @ui_auth()
+    def ui_backup_create():
+        data = _body()
+        comps = _components(data.get("components"))
+        paths = _paths(data.get("paths")) if "files" in comps else None
+        params = {"components": comps, "paths": paths}
+        _reject_duplicate(g.user["id"], "backup", params)
+        jid = database.create_job(g.user["id"], "backup", params)
+        return jsonify({"job": job_out(database.get_job(jid))}), 201
+
+    @app.post("/api/ui/backups/<int:backup_id>/restore")
+    @ui_auth()
+    def ui_restore(backup_id):
+        b = database.get_backup(backup_id)
+        if not b or b["user_id"] != g.user["id"]:
+            raise ApiError(404, "Không tìm thấy bản sao lưu", "not_found")
+        if b["status"] != "completed":
+            raise ApiError(409, "Bản sao lưu chưa hoàn tất", "not_completed")
+        data = _body()
+        target = data.get("target_dir") or None
+        if target is not None and (not isinstance(target, str) or len(target) > 1024):
+            raise ApiError(400, "Thư mục đích không hợp lệ", "bad_target")
+        params = {"filename": b["filename"], "dry_run": bool(data.get("dry_run")),
+                  "delete_extra": bool(data.get("delete_extra")), "target_dir": target,
+                  "restore_system": bool(data.get("restore_system", True))}
+        _reject_duplicate(g.user["id"], "restore", params)
+        jid = database.create_job(g.user["id"], "restore", params, backup_id=backup_id)
+        return jsonify({"job": job_out(database.get_job(jid))}), 201
+
+    @app.get("/api/ui/jobs")
+    @ui_auth()
+    def ui_jobs():
+        limit = min(max(int(request.args.get("limit", 30)), 1), 200)
+        return jsonify({"jobs": [job_out(j) for j in database.list_jobs(g.user["id"], limit)]})
+
+    @app.post("/api/ui/jobs/<int:job_id>/cancel")
+    @ui_auth()
+    def ui_job_cancel(job_id):
+        j = database.get_job(job_id)
+        if not j or j["user_id"] != g.user["id"]:
+            raise ApiError(404, "Không tìm thấy tác vụ", "not_found")
+        return jsonify({"job": job_out(database.cancel_job(job_id))})
+
+    # ---------------------------------------------------------------- lich
+    def _own_schedule(sid):
+        s = scheduler.get_schedule(sid)
+        if not s or (s["user_id"] != g.user["id"] and g.user["role"] != "admin"):
+            raise ApiError(404, "Không tìm thấy lịch", "not_found")
+        return s
+
+    @app.get("/api/ui/schedules")
+    @ui_auth()
+    def ui_schedules():
+        return jsonify({"schedules": [schedule_out(s) for s in scheduler.list_schedules(g.user["id"])]})
+
+    @app.post("/api/ui/schedules")
+    @ui_auth()
+    def ui_schedule_create():
+        d = _body()
+        name = str(d.get("name", "")).strip()[:80]
+        stype = d.get("schedule_type")
+        if not name:
+            raise ApiError(400, "Hãy đặt tên cho lịch", "no_name")
+        if stype not in scheduler.TYPES:
+            raise ApiError(400, "Kiểu lịch không hợp lệ", "bad_type")
+        hours = int(d.get("interval_hours") or 24)
+        tod = str(d.get("time_of_day") or "02:00")
+        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", tod):
+            raise ApiError(400, "Giờ chạy phải dạng HH:MM", "bad_time")
+        dow = int(d.get("day_of_week") or 0) % 7
+        comps = _components(d.get("components") or config.BACKUP_COMPONENTS)
+        paths = _paths(d.get("paths")) if "files" in comps else None
+        sid = scheduler.create_schedule(g.user["id"], name, stype, max(1, min(hours, 720)), tod, dow, paths, comps)
+        return jsonify({"schedule": schedule_out(scheduler.get_schedule(sid))}), 201
+
+    @app.post("/api/ui/schedules/<int:sid>/toggle")
+    @ui_auth()
+    def ui_schedule_toggle(sid):
+        _own_schedule(sid)
+        scheduler.toggle_schedule(sid)
+        return jsonify({"schedule": schedule_out(scheduler.get_schedule(sid))})
+
+    @app.post("/api/ui/schedules/<int:sid>/run")
+    @ui_auth()
+    def ui_schedule_run(sid):
+        s = _own_schedule(sid)
+        jid = database.create_job(s["user_id"], "backup", scheduler.job_params(s))
+        return jsonify({"job": job_out(database.get_job(jid))}), 201
+
+    @app.delete("/api/ui/schedules/<int:sid>")
+    @ui_auth()
+    def ui_schedule_delete(sid):
+        _own_schedule(sid)
+        scheduler.delete_schedule(sid)
+        return jsonify({"ok": True})
+
+    # ---------------------------------------------------------------- tai khoan
+    @app.get("/api/ui/me")
+    @ui_auth()
+    def ui_me():
+        return jsonify({"user": user_out(g.user, with_token=True), "server_url_hint": request.host_url.rstrip("/")})
+
+    @app.post("/api/ui/me/password")
+    @ui_auth()
+    def ui_me_password():
+        d = _body()
+        ok, _ = database.verify_password(str(d.get("current", "")), g.user["password"])
+        if not ok:
+            raise ApiError(400, "Mật khẩu hiện tại không đúng", "bad_password")
+        new = str(d.get("new", ""))
+        if len(new) < 8:
+            raise ApiError(400, "Mật khẩu mới cần ít nhất 8 ký tự", "weak_password")
+        database.update_user(g.user["id"], password=new)
+        session["pw"] = database.get_user_by_id(g.user["id"])["password"][-16:]
+        return jsonify({"ok": True})
+
+    @app.post("/api/ui/me/token")
+    @ui_auth()
+    def ui_me_token():
+        return jsonify({"token": database.rotate_token(g.user["id"])})
+
+    @app.get("/api/ui/system")
+    @ui_auth()
+    def ui_system():
+        try:
+            du = shutil.disk_usage(config.STORAGE_DIR)
+            disk = {"total": du.total, "used": du.used, "free": du.free}
+        except OSError:
+            disk = None
+        return jsonify({"version": config.VERSION, "hostname": platform.node(), "platform": platform.platform(),
+                        "storage_dir": config.STORAGE_DIR if g.user["role"] == "admin" else None,
+                        "disk": disk, "server_time": database.now_iso()})
+
+    # ---------------------------------------------------------------- quan tri user
+    @app.get("/api/ui/users")
+    @ui_auth(admin=True)
+    def ui_users():
+        return jsonify({"users": [user_out(u, with_token=True) for u in database.list_users()]})
+
+    @app.post("/api/ui/users")
+    @ui_auth(admin=True)
+    def ui_user_create():
+        d = _body()
+        username = str(d.get("username", "")).strip()
+        password = str(d.get("password", ""))
+        role = d.get("role") if d.get("role") in ("admin", "user") else "user"
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{3,32}", username):
+            raise ApiError(400, "Tên đăng nhập 3-32 ký tự: chữ, số, . _ -", "bad_username")
+        if len(password) < 8:
+            raise ApiError(400, "Mật khẩu cần ít nhất 8 ký tự", "weak_password")
+        if database.get_user_by_username(username):
+            raise ApiError(409, f"Tên '{username}' đã tồn tại", "exists")
+        uid = database.create_user(username, password, role)
+        return jsonify({"user": user_out(database.get_user_by_id(uid), with_token=True)}), 201
+
+    @app.patch("/api/ui/users/<int:uid>")
+    @ui_auth(admin=True)
+    def ui_user_update(uid):
+        target = database.get_user_by_id(uid)
+        if not target:
+            raise ApiError(404, "Không tìm thấy người dùng", "not_found")
+        d = _body()
+        role = d.get("role") if d.get("role") in ("admin", "user") else None
+        password = str(d.get("password") or "")
+        if password and len(password) < 8:
+            raise ApiError(400, "Mật khẩu cần ít nhất 8 ký tự", "weak_password")
+        if role == "user" and target["role"] == "admin" and database.count_admins() <= 1:
+            raise ApiError(409, "Phải còn ít nhất một quản trị viên", "last_admin")
+        database.update_user(uid, password=password or None, role=role)
+        return jsonify({"user": user_out(database.get_user_by_id(uid), with_token=True)})
+
+    @app.post("/api/ui/users/<int:uid>/token")
+    @ui_auth(admin=True)
+    def ui_user_token(uid):
+        if not database.get_user_by_id(uid):
+            raise ApiError(404, "Không tìm thấy người dùng", "not_found")
+        return jsonify({"token": database.rotate_token(uid)})
+
+    @app.delete("/api/ui/users/<int:uid>")
+    @ui_auth(admin=True)
+    def ui_user_delete(uid):
+        if uid == g.user["id"]:
+            raise ApiError(409, "Không thể tự xoá tài khoản đang dùng", "self")
+        if not database.get_user_by_id(uid):
+            raise ApiError(404, "Không tìm thấy người dùng", "not_found")
+        database.delete_user(uid)       # file backup trong kho KHONG bi xoa
+        return jsonify({"ok": True})
+
+    # ---------------------------------------------------------------- duyet thu muc may agent
+    def _agent_browser(path, params=None):
+        agents = [a for a in database.list_agents(g.user["id"]) if a.get("browser_port")]
+        if not agents:
+            raise ApiError(503, "Chưa có agent nào kết nối - hãy chạy agent trước", "no_agent")
+        a = agents[0]
+        hosts = [a["ip"], "127.0.0.1"] if a.get("ip") not in (None, "127.0.0.1", "::1") else ["127.0.0.1"]
+        last_err = None
+        for host in hosts:
+            host = f"[{host}]" if ":" in host else host
+            try:
+                r = requests.get(f"http://{host}:{a['browser_port']}{path}", params=params,
+                                 headers={"X-Auth-Token": g.user["token"]}, timeout=8)
+                return jsonify(r.json()), (200 if r.ok else 502)
+            except (requests.RequestException, ValueError) as e:
+                last_err = e
+        raise ApiError(502, f"Không kết nối được agent {a['hostname']}: {last_err}", "agent_unreachable")
+
+    @app.get("/api/ui/fs/quick")
+    @ui_auth()
+    def ui_fs_quick():
+        return _agent_browser("/folders/quick")
+
+    @app.get("/api/ui/fs/list")
+    @ui_auth()
+    def ui_fs_list():
+        return _agent_browser("/folders/list", {"path": request.args.get("path", "")})
+
+    # ================================================================ API cho agent
+    @app.get("/api/jobs/poll")
+    @agent_auth
+    def api_poll():
+        uid = g.agent_user["id"]
+        if request.args.get("startup") == "1":
+            database.fail_running_jobs(uid, "Agent khởi động lại khi tác vụ đang chạy")
+        job = database.claim_next_job(uid)
+        _touch_agent(job["id"] if job else None)
+        if not job:
+            return jsonify({"job": None})
+        u = g.agent_user
+        job["params"] = _loads(job.get("params"), {}) or {}
+        job["_user"] = {"id": u["id"], "username": u["username"], "token": u["token"],
+                        "encryption_key": u["encryption_key"]}
+        return jsonify({"job": job})
+
+    def _agent_job(job_id):
+        j = database.get_job(job_id)
+        if not j or j["user_id"] != g.agent_user["id"]:
+            raise ApiError(404, "Không tìm thấy job", "not_found")
+        return j
+
+    @app.post("/api/jobs/<int:job_id>/update")
+    @agent_auth
+    def api_job_update(job_id):
+        j = _agent_job(job_id)
+        d = request.get_json(silent=True) or {}
+        upd = {}
+        status = d.get("status")
+        if status in JOB_STATUSES and j["status"] not in TERMINAL:
+            upd["status"] = status
+        if j["status"] not in TERMINAL or status in TERMINAL:
+            if "progress" in d:
+                upd["progress"] = max(0, min(int(d.get("progress") or 0), 100))
+            if "message" in d:
+                upd["message"] = str(d.get("message") or "")[:1000]
+        if d.get("completed") and j["status"] not in TERMINAL:
+            upd["completed_at"] = database.now_iso()
+        if upd:
+            database.update_job(job_id, **upd)
+        _touch_agent(None if upd.get("status") in TERMINAL else job_id)
+        return jsonify({"ok": True, "cancel": bool(j.get("cancel_requested"))})
+
+    @app.post("/api/jobs/<int:job_id>/backup_done")
+    @agent_auth
+    def api_backup_done(job_id):
+        j = _agent_job(job_id)
+        if j["job_type"] != "backup":
+            raise ApiError(400, "Job không phải sao lưu", "bad_job")
+        d = request.get_json(silent=True) or {}
+        filename = str(d.get("filename", ""))
+        if not FILENAME_RE.match(filename):
+            raise ApiError(400, "Tên file không hợp lệ", "bad_filename")
+        path = os.path.join(user_dir(g.agent_user["id"]), filename)
+        if not os.path.isfile(path) or os.path.getsize(path) != int(d.get("size") or -1):
+            raise ApiError(409, "File backup trên kho không khớp báo cáo của agent", "mismatch")
+        comps = d.get("components") or []
+        ss = dict(d.get("snapshot_summary") or {})
+        ss["components"] = comps
+        is_full = set(comps) >= set(config.BACKUP_COMPONENTS)
+        bid = database.create_backup_record(g.agent_user["id"], filename, d.get("paths") or [],
+                                            "full" if is_full else "selected")
+        database.update_backup(bid, size=os.path.getsize(path), status="completed",
+                               snapshot_summary=json.dumps(ss, ensure_ascii=False),
+                               stats=json.dumps(d.get("stats") or {}, ensure_ascii=False))
+        database.update_job(job_id, backup_id=bid)
+        return jsonify({"ok": True, "backup_id": bid})
+
+    # ---------------------------------------------------------------- kho (chi them, khong xoa)
+    @app.put("/api/storage/backups/<filename>")
+    @agent_auth
+    def api_storage_put(filename):
+        if not FILENAME_RE.match(filename):
+            raise ApiError(400, "Tên file không hợp lệ", "bad_filename")
+        d = user_dir(g.agent_user["id"])
+        dest = os.path.join(d, filename)
+        if os.path.exists(dest):
+            raise ApiError(409, "File đã tồn tại - kho không cho ghi đè", "exists")
+        tmp = os.path.join(d, f".{filename}.{secrets.token_hex(4)}.part")
+        h, size = hashlib.sha256(), 0
+        try:
+            with open(tmp, "wb") as out:
+                stream = request.stream
+                while True:
+                    block = stream.read(STREAM_BUF)
+                    if not block:
+                        break
+                    size += len(block)
+                    if size > config.MAX_UPLOAD_BYTES:
+                        raise ApiError(413, "File vượt giới hạn dung lượng", "too_large")
+                    h.update(block)
+                    out.write(block)
+                out.flush()
+                os.fsync(out.fileno())
+            if request.content_length is not None and size != request.content_length:
+                raise ApiError(400, "Nhận thiếu dữ liệu", "incomplete")
+            try:
+                os.link(tmp, dest)          # loi neu dich da co -> khong bao gio ghi de
+            except FileExistsError:
+                raise
+            except OSError:                 # o dia khong ho tro hard link (FAT/exFAT...)
+                os.rename(tmp, dest)        # Windows: van loi neu dich da co
+            else:
+                os.remove(tmp)
+        except BaseException as e:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            if isinstance(e, FileExistsError):
+                raise ApiError(409, "File đã tồn tại - kho không cho ghi đè", "exists") from None
+            raise
+        log.info("Nhận %s của %s (%s byte)", filename, g.agent_user["username"], f"{size:,}")
+        return jsonify({"ok": True, "size": size, "sha256": h.hexdigest(),
+                        "path": f"user_{g.agent_user['id']}/{filename}"}), 201
+
+    @app.get("/api/storage/backups/<filename>")
+    @agent_auth
+    def api_storage_get(filename):
+        if not FILENAME_RE.match(filename):
+            raise ApiError(400, "Tên file không hợp lệ", "bad_filename")
+        path = os.path.join(user_dir(g.agent_user["id"]), filename)
+        if not os.path.isfile(path):
+            raise ApiError(404, "Không có file này", "not_found")
+        return send_file(path, mimetype="application/octet-stream", conditional=True, max_age=0)
+
+    @app.get("/api/storage/backups")
+    @agent_auth
+    def api_storage_list():
+        d = user_dir(g.agent_user["id"])
+        files = [{"filename": n, "size": os.path.getsize(os.path.join(d, n)),
+                  "modified": ts(datetime.fromtimestamp(os.path.getmtime(os.path.join(d, n))).isoformat())}
+                 for n in sorted(os.listdir(d)) if FILENAME_RE.match(n)]
+        return jsonify({"files": files})
+
+    if start_scheduler:
+        scheduler.start_scheduler()
+    return app
 
 
-# ===== FOLDER BROWSER PROXY (forward to agent) =====
-
-# IP cua agent (Win 2012). De trong de tu phat hien theo IP cua agent gan day nhat.
-AGENT_BROWSER_PORT = 5001
-# Theo doi IP agent qua API polling (xem api_poll_job)
-_last_agent_ip = {"ip": None}
-
-
-def _get_agent_url():
-    """Lay URL agent de proxy folder browse"""
-    ip = _last_agent_ip.get("ip")
-    if not ip:
-        # Fallback: thu local
-        return f"http://127.0.0.1:{AGENT_BROWSER_PORT}"
-    return f"http://{ip}:{AGENT_BROWSER_PORT}"
-
-
-@app.route("/api/folder-browser/quick")
-@login_required
-def api_browse_quick():
-    """Lay quick picks tu agent (server proxy den agent)"""
+def main(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser(description="Backup server (web + API + kho)")
+    ap.add_argument("--host", default=config.SERVER_HOST, help="dia chi nghe (mac dinh 0.0.0.0; thu tren may: 127.0.0.1)")
+    ap.add_argument("--port", type=int, default=config.SERVER_PORT)
+    args = ap.parse_args(argv)
+    setup_logging("server", config.LOGS_DIR)
+    app = create_app(start_scheduler=True)
+    log.info("BACKUP SERVER %s - nghe http://%s:%s", config.VERSION, args.host, args.port)
+    log.info("Dữ liệu: kho=%s | CSDL=%s", config.STORAGE_DIR, config.DB_PATH)
     try:
-        url = f"{_get_agent_url()}/folders/quick"
-        r = _requests.get(url, timeout=10)
-        return jsonify(r.json())
-    except Exception as e:
-        return jsonify({"error": f"Khong ket noi duoc den agent: {e}",
-                        "agent_url": _get_agent_url()}), 502
+        from waitress import serve
+    except ImportError:
+        log.warning("Chưa cài waitress - dùng server thử nghiệm của Flask")
+        app.run(host=args.host, port=args.port, threaded=True)
+        return
+    serve(app, host=args.host, port=args.port, threads=8,
+          max_request_body_size=config.MAX_UPLOAD_BYTES, channel_timeout=300, ident="backup-server")
 
-
-@app.route("/api/folder-browser/list")
-@login_required
-def api_browse_list():
-    """Liet ke thu muc tu agent (server proxy den agent)"""
-    path = request.args.get("path", "")
-    try:
-        url = f"{_get_agent_url()}/folders/list"
-        r = _requests.get(url, params={"path": path}, timeout=15)
-        return jsonify(r.json())
-    except Exception as e:
-        return jsonify({"error": f"Khong ket noi duoc den agent: {e}",
-                        "agent_url": _get_agent_url()}), 502
-
-
-# ===== SCHEDULE ROUTES (Lap lich backup tu dong) =====
-
-@app.route("/schedules")
-@login_required
-def schedules_page():
-    """Trang quan ly lich backup"""
-    user = current_user()
-    if user["role"] == "admin":
-        scheds = scheduler.list_schedules()
-    else:
-        scheds = scheduler.list_schedules(user["id"])
-    return render_template("schedules.html", user=user, schedules=scheds)
-
-
-@app.route("/schedules/add", methods=["POST"])
-@login_required
-def add_schedule():
-    """Tao lich backup moi"""
-    user = current_user()
-    name = request.form.get("name", "").strip()
-    schedule_type = request.form.get("schedule_type", "daily")
-    interval_hours = int(request.form.get("interval_hours", 24) or 24)
-    time_of_day = request.form.get("time_of_day", "02:00")
-    day_of_week = int(request.form.get("day_of_week", 0) or 0)
-    selected_path = request.form.get("path", "").strip()
-
-    if not name:
-        flash("Vui long nhap ten lich backup.", "danger")
-        return redirect(url_for("schedules_page"))
-
-    backup_paths = [selected_path] if selected_path else None
-    sched_id = scheduler.create_schedule(
-        user["id"], name, schedule_type, interval_hours,
-        time_of_day, day_of_week, backup_paths
-    )
-    flash(f"Da tao lich backup '{name}' (#{sched_id}).", "success")
-    return redirect(url_for("schedules_page"))
-
-
-@app.route("/schedules/<int:sched_id>/toggle", methods=["POST"])
-@login_required
-def toggle_schedule_route(sched_id):
-    """Bat/tat lich backup"""
-    user = current_user()
-    sched = scheduler.get_schedule(sched_id)
-    if not sched or (sched["user_id"] != user["id"] and user["role"] != "admin"):
-        flash("Lich khong ton tai.", "danger")
-        return redirect(url_for("schedules_page"))
-    new_state = scheduler.toggle_schedule(sched_id)
-    status = "bat" if new_state else "tat"
-    flash(f"Da {status} lich backup '{sched['name']}'.", "info")
-    return redirect(url_for("schedules_page"))
-
-
-@app.route("/schedules/<int:sched_id>/delete", methods=["POST"])
-@login_required
-def delete_schedule_route(sched_id):
-    """Xoa lich backup"""
-    user = current_user()
-    sched = scheduler.get_schedule(sched_id)
-    if not sched or (sched["user_id"] != user["id"] and user["role"] != "admin"):
-        flash("Lich khong ton tai.", "danger")
-        return redirect(url_for("schedules_page"))
-    scheduler.delete_schedule(sched_id)
-    flash(f"Da xoa lich backup '{sched['name']}'.", "success")
-    return redirect(url_for("schedules_page"))
-
-
-@app.route("/api/schedules")
-@login_required
-def api_schedules():
-    """API lay danh sach lich (cho auto-refresh)"""
-    user = current_user()
-    if user["role"] == "admin":
-        scheds = scheduler.list_schedules()
-    else:
-        scheds = scheduler.list_schedules(user["id"])
-    return jsonify(scheds)
-
-
-# ===== STARTUP =====
 
 if __name__ == "__main__":
-    print("="*60)
-    print("  BACKUP SYSTEM - SERVER")
-    print("  Chay tren Windows Server 2016 (vai tro storage)")
-    print(f"  Lang nghe tai: http://{config.SERVER_HOST}:{config.SERVER_PORT}")
-    print(f"  Storage path: {config.STORAGE_DIR}")
-    print(f"  Database:     {config.DB_PATH}")
-    print("="*60)
-    print()
-    print("  Tai khoan mac dinh:")
-    print("    admin / admin123")
-    print("    user1 / user123")
-    print("="*60)
-
-    database.init_db()
-
-    # Khoi dong scheduler thread (lap lich backup tu dong)
-    scheduler.start_scheduler()
-    print("  [OK] Scheduler da khoi dong - tu dong chay backup theo lich")
-    print("="*60)
-
-    app.run(host=config.SERVER_HOST, port=config.SERVER_PORT, debug=False, threaded=True)
+    main()

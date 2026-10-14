@@ -59,6 +59,9 @@ secret_key.txt
 agent_config.local.txt
 config.local.py
 
+# ===== Server: khoa phien, mat khau admin lan dau =====
+instance/
+
 # ===== v2: benchmark / test =====
 # Bo du lieu mau va thu muc lam viec cua bench (sinh lai duoc tu seed)
 bench/data/

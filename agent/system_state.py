@@ -1,619 +1,406 @@
 """
-Backup va restore system state tren Windows:
-- Network adapter (IP, DNS, gateway, mode: Host-only/NAT/Bridged)
-- Windows Firewall (Domain/Private/Public profiles)
-- Windows Defender (Real-time protection)
+Ghi nhan / khoi phuc cau hinh he thong Windows:
+  card mang (IPv4/IPv6), firewall (3 profile + rule), Defender,
+  persistent route, hosts, SMB share, portproxy.
 
-Chu y: Module nay dung subprocess goi PowerShell va netsh.
-Cac lenh duoc viet de tuong thich Windows Server 2012 R2 va moi hon.
+Toi uu so voi v1 goc:
+  - Ghi nhan bang MOT tien trinh PowerShell duy nhat (v1 goi ~8 tien trinh, moi cai
+    ton 0,3-1 s khoi dong) va CHI lay thanh phan duoc chon.
+  - Xuat JSON UTF-8 -> ten card/share tieng Viet khong bi loi ma.
+  - Dung cmdlet (khong phu thuoc ngon ngu Windows) thay vi doc chu cua netsh/route;
+    netsh chi con la phuong an du phong.
+  - Port filter cua firewall rule lay 1 lan roi noi theo InstanceID (cmdlet tra ket
+    qua khong theo thu tu dau vao).
+Khoi phuc giu nguyen cac lenh netsh cua v1 (da kiem chung tren Server 2012), them
+kiem tra dau vao de chong chen lenh.
 """
-# Auto-add shared/ to import path (cho phep import config, database, snapshot, encryption_utils)
-import sys
-import os
-_SHARED = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "shared"))
-if _SHARED not in sys.path:
-    sys.path.insert(0, _SHARED)
-
-import subprocess
 import json
-import sys
-import os
+import logging
 import platform
-import re
+
+from agent import network_advanced
+from agent.winexec import IS_WINDOWS, run_cmd, run_ps, safe_arg
+
+log = logging.getLogger("agent.system")
+HOSTS_PATH = r"C:\Windows\System32\drivers\etc\hosts"
+
+NETWORK_COMPONENTS = ["ipv4", "ipv6", "firewall", "hosts", "shares", "route", "portproxy", "defender"]
 
 
-IS_WINDOWS = platform.system() == "Windows"
+# ===================================================================== ghi nhan
+
+_PS_CAPTURE = r"""
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$ErrorActionPreference = 'SilentlyContinue'
+$want = @(__WANT__)
+$r = [ordered]@{}
+if ($want -contains 'adapters') {
+  # Lay hang loat roi noi theo ifIndex (Get-NetIPConfiguration -Detailed cham gap ~15 lan)
+  $ads = @{}; foreach ($n in @(Get-NetAdapter)) { $ads[[int]$n.ifIndex] = $n }
+  $ifs = @{}; foreach ($i in @(Get-NetIPInterface)) { $ifs["$($i.ifIndex)-$([int]$i.AddressFamily)"] = $i }
+  $dns = @{}; foreach ($d in @(Get-DnsClientServerAddress)) { $dns["$($d.InterfaceIndex)-$([int]$d.AddressFamily)"] = @($d.ServerAddresses) }
+  $gws = @{}; foreach ($g in @(Get-NetRoute -DestinationPrefix '0.0.0.0/0','::/0')) {
+    $k = "$($g.ifIndex)-$([int]$g.AddressFamily)"; if (-not $gws.ContainsKey($k)) { $gws[$k] = $g.NextHop } }
+  $ips = @(Get-NetIPAddress | Where-Object { $ads.ContainsKey([int]$_.InterfaceIndex) })
+  $list = New-Object System.Collections.ArrayList
+  foreach ($idx in @($ips | ForEach-Object { [int]$_.InterfaceIndex } | Sort-Object -Unique)) {
+    $na = $ads[$idx]
+    $v4 = $ips | Where-Object { $_.InterfaceIndex -eq $idx -and [int]$_.AddressFamily -eq 2 } | Select-Object -First 1
+    $v6 = $ips | Where-Object { $_.InterfaceIndex -eq $idx -and [int]$_.AddressFamily -eq 23 -and
+                                $_.IPAddress -notlike 'fe80*' -and [string]$_.SuffixOrigin -ne 'Random' } | Select-Object -First 1
+    [void]$list.Add([ordered]@{
+      name = $na.Name; mac = $na.MacAddress; status = [string]$na.Status; index = $idx
+      v4_ip = $v4.IPAddress; v4_prefix = $v4.PrefixLength; v4_gateway = @($gws["$idx-2"])
+      v4_dns = $dns["$idx-2"]; v4_dhcp = [string]$ifs["$idx-2"].Dhcp
+      v6_ip = $v6.IPAddress; v6_prefix = $v6.PrefixLength; v6_gateway = @($gws["$idx-23"])
+      v6_dns = $dns["$idx-23"]; v6_dhcp = [string]$ifs["$idx-23"].Dhcp
+    })
+  }
+  $r.adapters = $list
+}
+if ($want -contains 'firewall') {
+  try {
+    # COM FwPolicy2: khong can nap module NetSecurity (~4 s) va doc duoc ca khi khong la admin
+    $fw = New-Object -ComObject HNetCfg.FwPolicy2 -ErrorAction Stop
+    $r.firewall_profiles = @(foreach ($p in @(@('Domain', 1), @('Private', 2), @('Public', 4))) {
+      [ordered]@{ name = $p[0]; enabled = [string]$fw.FirewallEnabled($p[1])
+        inbound = $(if ($fw.DefaultInboundAction($p[1]) -eq 1) { 'Allow' } else { 'Block' })
+        outbound = $(if ($fw.DefaultOutboundAction($p[1]) -eq 0) { 'Block' } else { 'Allow' }) } })
+    $proto = @{ 1 = 'ICMPv4'; 6 = 'TCP'; 17 = 'UDP'; 58 = 'ICMPv6'; 256 = 'Any' }
+    $r.firewall_rules = @($fw.Rules | Where-Object { $_.Enabled -and $_.Name -notlike '@*' } | Select-Object -First 100 |
+      ForEach-Object {
+        $pr = @(); if ($_.Profiles -band 1) { $pr += 'Domain' }; if ($_.Profiles -band 2) { $pr += 'Private' }; if ($_.Profiles -band 4) { $pr += 'Public' }
+        [ordered]@{ Name = $_.Name; Direction = $(if ($_.Direction -eq 2) { 'Outbound' } else { 'Inbound' })
+          Action = $(if ($_.Action -eq 1) { 'Allow' } else { 'Block' })
+          Protocol = $(if ($proto.ContainsKey([int]$_.Protocol)) { $proto[[int]$_.Protocol] } else { [string]$_.Protocol })
+          LocalPort = $(if ($_.LocalPorts -and $_.LocalPorts -ne '*') { $_.LocalPorts } else { 'Any' })
+          RemotePort = $(if ($_.RemotePorts -and $_.RemotePorts -ne '*') { $_.RemotePorts } else { 'Any' })
+          Profile = $(if ($pr.Count -eq 3 -or $pr.Count -eq 0) { 'Any' } else { $pr -join ', ' }) } })
+  } catch {
+    $r.firewall_profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore | ForEach-Object {
+      [ordered]@{ name = [string]$_.Name; enabled = [string]$_.Enabled
+                  inbound = [string]$_.DefaultInboundAction; outbound = [string]$_.DefaultOutboundAction } })
+    $rules = @(Get-NetFirewallRule -Enabled True | Where-Object { $_.DisplayName -notlike '@*' } | Select-Object -First 100)
+    $pf = @{}
+    try { Get-NetFirewallPortFilter -All -ErrorAction Stop | ForEach-Object { $pf[$_.InstanceID] = $_ } }
+    catch { foreach ($f in @($rules | Get-NetFirewallPortFilter)) { $pf[$f.InstanceID] = $f } }
+    $r.firewall_rules = @($rules | ForEach-Object { $f = $pf[$_.Name]
+      [ordered]@{ Name = $_.DisplayName; Direction = [string]$_.Direction; Action = [string]$_.Action
+                  Protocol = [string]$f.Protocol; LocalPort = [string]$f.LocalPort
+                  RemotePort = [string]$f.RemotePort; Profile = [string]$_.Profile } })
+  }
+}
+if ($want -contains 'defender') {
+  try { $p = Get-MpPreference -ErrorAction Stop
+        $r.defender = [ordered]@{ realtime_enabled = -not $p.DisableRealtimeMonitoring
+          behavior_enabled = -not $p.DisableBehaviorMonitoring; ioav_enabled = -not $p.DisableIOAVProtection
+          available = $true } }
+  catch { $r.defender = @{ available = $false } }
+}
+if ($want -contains 'route') {
+  $r.routes = @(Get-NetRoute -AddressFamily IPv4 -PolicyStore PersistentStore | ForEach-Object {
+    [ordered]@{ prefix = $_.DestinationPrefix; next_hop = $_.NextHop; metric = $_.RouteMetric } })
+  $r.route_print = (route print -4 | Out-String)
+}
+if ($want -contains 'shares') {
+  $r.shares = @(Get-SmbShare | Where-Object { $_.Name -notlike '*$' } | ForEach-Object {
+    [ordered]@{ Name = $_.Name; Path = $_.Path; Description = $_.Description } })
+}
+if ($want -contains 'portproxy') { $r.portproxy_text = (netsh interface portproxy show all | Out-String) }
+$r | ConvertTo-Json -Depth 6 -Compress
+"""
 
 
-def _run_ps(script, timeout=30):
-    """Chay PowerShell script va tra ve stdout"""
-    if not IS_WINDOWS:
-        return ""
+def _as_list(x):
+    if isinstance(x, list):
+        return [v for v in x if v]
+    return [x] if x else []
+
+
+def prefix_to_mask(prefix):
     try:
-        result = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
-            capture_output=True, text=True, timeout=timeout
-        )
-        return result.stdout
-    except Exception as e:
-        print(f"[system_state] PowerShell error: {e}")
-        return ""
-
-
-def _run_cmd(args, timeout=30):
-    """Chay lenh cmd"""
-    if not IS_WINDOWS:
-        return ""
-    try:
-        result = subprocess.run(
-            args, capture_output=True, text=True, timeout=timeout, shell=True
-        )
-        return result.stdout
-    except Exception as e:
-        print(f"[system_state] cmd error: {e}")
-        return ""
-
-
-# ===== NETWORK ADAPTER =====
-
-def detect_network_mode(ip_address):
-    """
-    Phat hien che do network adapter dua tren dai IP:
-    - VMware Host-only (theo cau hinh do an): 192.168.10.x
-    - VMware Host-only mac dinh khac: 192.168.146.x, 192.168.137.x
-    - VMware NAT: 192.168.x.x (gateway co .2)
-    - Bridged: dai IP cua mang vat ly
-    Day la heuristic - co the tinh chinh theo cau hinh thuc te
-    """
-    if not ip_address:
-        return "Unknown"
-
-    parts = ip_address.split(".")
-    if len(parts) != 4:
-        return "Unknown"
-
-    # Dai Host-only dung trong do an nay (192.168.10.0/24) va cac dai
-    # Host-only mac dinh pho bien cua VMware
-    if (ip_address.startswith("192.168.10.")
-            or ip_address.startswith("192.168.146.")
-            or ip_address.startswith("192.168.137.")):
-        return "Host-only"
-    # VMnet8 (NAT) mac dinh
-    if ip_address.startswith("192.168.") and parts[2] in ["80", "100", "110", "44"]:
-        return "NAT"
-    # Mac dinh: doan theo subnet phoi bien
-    return "Unknown"
-
-
-def get_network_adapters():
-    """
-    Lay thong tin tat ca network adapter active.
-    Ho tro DAY DU ca IPv4 va IPv6:
-    - IPv4: dia chi, prefix, gateway, DNS, DHCP
-    - IPv6: dia chi, prefix, gateway, DNS, autoconfig
-    """
-    if not IS_WINDOWS:
-        return [{
-            "name": "demo", "mac": "00:0C:29:00:00:00", "status": "Up",
-            "index": 1, "mode": "Host-only",
-            "ipv4": {
-                "ip": "192.168.10.2", "prefix": 24,
-                "subnet_mask": "255.255.255.0",
-                "gateway": "192.168.10.1", "dns": ["8.8.8.8"], "dhcp": False
-            },
-            "ipv6": {
-                "ip": "fe80::20c:29ff:fe00:0", "prefix": 64,
-                "subnet_mask": None,
-                "gateway": None, "dns": ["2001:4860:4860::8888"], "dhcp": True
-            },
-            # Tuong thich nguoc voi code cu
-            "ip": "192.168.10.2", "prefix": 24,
-            "subnet_mask": "255.255.255.0",
-            "gateway": "192.168.10.1", "dns": ["8.8.8.8"], "dhcp": False
-        }]
-
-    script = """
-    $adapters = Get-NetIPConfiguration -Detailed -ErrorAction SilentlyContinue
-    $result = @()
-    foreach ($a in $adapters) {
-        $idx = $a.InterfaceIndex
-        # ----- IPv4 -----
-        $ipv4 = $a.IPv4Address | Select-Object -First 1
-        $dns4 = ($a.DNSServer | Where-Object {$_.AddressFamily -eq 2}).ServerAddresses
-        $dhcp4 = (Get-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue).Dhcp
-        # ----- IPv6 -----
-        $ipv6 = $a.IPv6Address | Select-Object -First 1
-        $dns6 = ($a.DNSServer | Where-Object {$_.AddressFamily -eq 23}).ServerAddresses
-        $v6if = Get-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv6 -ErrorAction SilentlyContinue
-        $dhcp6 = $v6if.Dhcp
-        $autocfg6 = $v6if.AddressFamily
-        $obj = @{
-            name = $a.InterfaceAlias
-            mac = (Get-NetAdapter -InterfaceIndex $idx -ErrorAction SilentlyContinue).MacAddress
-            status = (Get-NetAdapter -InterfaceIndex $idx -ErrorAction SilentlyContinue).Status
-            index = $idx
-            v4_ip = if ($ipv4) { $ipv4.IPAddress } else { $null }
-            v4_prefix = if ($ipv4) { $ipv4.PrefixLength } else { $null }
-            v4_gateway = if ($a.IPv4DefaultGateway) { $a.IPv4DefaultGateway.NextHop } else { $null }
-            v4_dns = $dns4
-            v4_dhcp = "$dhcp4"
-            v6_ip = if ($ipv6) { $ipv6.IPAddress } else { $null }
-            v6_prefix = if ($ipv6) { $ipv6.PrefixLength } else { $null }
-            v6_gateway = if ($a.IPv6DefaultGateway) { $a.IPv6DefaultGateway.NextHop } else { $null }
-            v6_dns = $dns6
-            v6_dhcp = "$dhcp6"
-        }
-        $result += New-Object PSObject -Property $obj
-    }
-    $result | ConvertTo-Json -Depth 5 -Compress
-    """
-    out = _run_ps(script)
-    try:
-        data = json.loads(out) if out.strip() else []
-        if isinstance(data, dict):
-            data = [data]
-        adapters = []
-        for a in data:
-            v4_ip = a.get("v4_ip")
-            v6_ip = a.get("v6_ip")
-            # Bo qua adapter khong co IP nao
-            if not v4_ip and not v6_ip:
-                continue
-
-            def _as_list(x):
-                if isinstance(x, list):
-                    return x
-                return [x] if x else []
-
-            mode = detect_network_mode(v4_ip or "")
-            v4_prefix = a.get("v4_prefix")
-            ipv4 = {
-                "ip": v4_ip,
-                "prefix": v4_prefix,
-                "subnet_mask": _prefix_to_mask(v4_prefix) if v4_prefix else None,
-                "gateway": a.get("v4_gateway"),
-                "dns": _as_list(a.get("v4_dns")),
-                "dhcp": "Enabled" in str(a.get("v4_dhcp", "")),
-            }
-            ipv6 = {
-                "ip": v6_ip,
-                "prefix": a.get("v6_prefix"),
-                "subnet_mask": None,  # IPv6 dung prefix length, khong dung subnet mask
-                "gateway": a.get("v6_gateway"),
-                "dns": _as_list(a.get("v6_dns")),
-                "dhcp": "Enabled" in str(a.get("v6_dhcp", "")),
-            }
-            adapters.append({
-                "name": a.get("name"),
-                "mac": a.get("mac"),
-                "status": a.get("status"),
-                "index": a.get("index"),
-                "mode": mode,
-                "ipv4": ipv4,
-                "ipv6": ipv6,
-                # Tuong thich nguoc voi code cu (compare_system_state cu)
-                "ip": ipv4["ip"],
-                "prefix": ipv4["prefix"],
-                "subnet_mask": ipv4["subnet_mask"],
-                "gateway": ipv4["gateway"],
-                "dns": ipv4["dns"],
-                "dhcp": ipv4["dhcp"],
-            })
-        return adapters
-    except json.JSONDecodeError as e:
-        print(f"[system_state] JSON parse error: {e}, raw: {out[:200]}")
-        return []
-
-
-def restore_network_adapter(adapter_info):
-    """
-    Khoi phuc cau hinh network adapter ve trang thai luc backup.
-    Khoi phuc DAY DU ca IPv4 va IPv6.
-    Su dung netsh de tuong thich nhieu phien ban Windows.
-    """
-    if not IS_WINDOWS:
-        print(f"[system_state] (Skip - non-Windows) Restore adapter: {adapter_info.get('name')}")
-        return True
-
-    name = adapter_info.get("name")
-    if not name:
-        return False
-
-    # Lay cau hinh IPv4 / IPv6 (ho tro ca format cu va moi)
-    ipv4 = adapter_info.get("ipv4")
-    ipv6 = adapter_info.get("ipv6")
-    if ipv4 is None:
-        # Format cu - chi co IPv4 o cap goc
-        ipv4 = {
-            "ip": adapter_info.get("ip"),
-            "prefix": adapter_info.get("prefix"),
-            "gateway": adapter_info.get("gateway"),
-            "dns": adapter_info.get("dns") or [],
-            "dhcp": adapter_info.get("dhcp", False),
-        }
-
-    # ===== KHOI PHUC IPv4 =====
-    if ipv4 and ipv4.get("ip"):
-        _restore_ipv4(name, ipv4)
-    elif ipv4 and ipv4.get("dhcp"):
-        _restore_ipv4(name, ipv4)
-
-    # ===== KHOI PHUC IPv6 =====
-    if ipv6 and (ipv6.get("ip") or ipv6.get("dhcp")):
-        _restore_ipv6(name, ipv6)
-
-    return True
-
-
-def _restore_ipv4(name, ipv4):
-    """Khoi phuc cau hinh IPv4 cho adapter (IP, subnet mask, default gateway, DNS)"""
-    dhcp = ipv4.get("dhcp", False)
-    ip = ipv4.get("ip")
-    prefix = ipv4.get("prefix") or 24
-    gateway = ipv4.get("gateway")
-    dns = ipv4.get("dns") or []
-
-    if dhcp:
-        _run_cmd(f'netsh interface ipv4 set address name="{name}" source=dhcp')
-        _run_cmd(f'netsh interface ipv4 set dnsservers name="{name}" source=dhcp')
-        print(f"[system_state] {name} IPv4 -> DHCP")
-        return
-
-    if not ip:
-        return
-
-    # Uu tien subnet_mask da luu trong backup, neu khong co thi tinh tu prefix
-    mask = ipv4.get("subnet_mask") or _prefix_to_mask(prefix)
-
-    # netsh: set address static <IP> <SUBNET_MASK> <DEFAULT_GATEWAY> <gateway_metric>
-    cmd = f'netsh interface ipv4 set address name="{name}" static {ip} {mask}'
-    if gateway:
-        cmd += f" {gateway} 1"
-    _run_cmd(cmd)
-    print(f"[system_state] {name} IPv4 -> IP={ip} | Subnet mask={mask} | Default gateway={gateway}")
-
-    if dns:
-        _run_cmd(f'netsh interface ipv4 set dnsservers name="{name}" static {dns[0]} primary')
-        for i, d in enumerate(dns[1:], 2):
-            _run_cmd(f'netsh interface ipv4 add dnsservers name="{name}" {d} index={i}')
-        print(f"[system_state] {name} IPv4 DNS -> {dns}")
-
-
-def _restore_ipv6(name, ipv6):
-    """Khoi phuc cau hinh IPv6 cho adapter"""
-    dhcp = ipv6.get("dhcp", False)
-    ip = ipv6.get("ip")
-    prefix = ipv6.get("prefix") or 64
-    gateway = ipv6.get("gateway")
-    dns = ipv6.get("dns") or []
-
-    if dhcp:
-        # IPv6 dung DHCPv6 / autoconfig
-        _run_cmd(f'netsh interface ipv6 set interface "{name}" routerdiscovery=enabled')
-        _run_cmd(f'netsh interface ipv6 set dnsservers name="{name}" source=dhcp')
-        print(f"[system_state] {name} IPv6 -> DHCP/Autoconfig")
-        return
-
-    if not ip:
-        return
-
-    # Bo qua link-local (fe80::) - dia chi nay tu sinh, khong can restore
-    if ip.lower().startswith("fe80"):
-        print(f"[system_state] {name} IPv6 {ip} la link-local, bo qua")
-        return
-
-    # Static IPv6
-    cmd = f'netsh interface ipv6 set address interface="{name}" address={ip}/{prefix}'
-    _run_cmd(cmd)
-    print(f"[system_state] {name} IPv6 -> {ip}/{prefix}")
-
-    if gateway:
-        _run_cmd(f'netsh interface ipv6 add route ::/0 "{name}" {gateway}')
-        print(f"[system_state] {name} IPv6 gateway -> {gateway}")
-
-    if dns:
-        _run_cmd(f'netsh interface ipv6 set dnsservers name="{name}" static {dns[0]} primary')
-        for i, d in enumerate(dns[1:], 2):
-            _run_cmd(f'netsh interface ipv6 add dnsservers name="{name}" {d} index={i}')
-
-
-def _prefix_to_mask(prefix):
-    """Doi prefix length sang subnet mask"""
-    try:
-        prefix = int(prefix)
-        mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF
-        return f"{(mask >> 24) & 0xFF}.{(mask >> 16) & 0xFF}.{(mask >> 8) & 0xFF}.{mask & 0xFF}"
-    except Exception:
+        p = int(prefix)
+        m = (0xFFFFFFFF << (32 - p)) & 0xFFFFFFFF
+        return ".".join(str((m >> s) & 0xFF) for s in (24, 16, 8, 0))
+    except (TypeError, ValueError):
         return "255.255.255.0"
 
 
-# ===== WINDOWS FIREWALL =====
-
-def get_firewall_state():
-    """
-    Lay trang thai Windows Firewall cho 3 profile.
-    Dung netsh lam nguon chinh (chinh xac hon PowerShell tren Server 2012).
-    """
-    if not IS_WINDOWS:
-        return {
-            "Domain": {"enabled": True, "inbound": "Block", "outbound": "Allow"},
-            "Private": {"enabled": False, "inbound": "Block", "outbound": "Allow"},
-            "Public": {"enabled": True, "inbound": "Block", "outbound": "Allow"}
-        }
-
-    result = {
-        "Domain":  {"enabled": False, "inbound": "Block", "outbound": "Allow"},
-        "Private": {"enabled": False, "inbound": "Block", "outbound": "Allow"},
-        "Public":  {"enabled": False, "inbound": "Block", "outbound": "Allow"}
-    }
-
-    # === PHUONG PHAP 1: netsh (chinh xac nhat tren Server 2012) ===
-    try:
-        out = _run_cmd("netsh advfirewall show allprofiles")
-        if out:
-            current_prof = None
-            for line in out.splitlines():
-                line = line.strip()
-                if "Domain Profile" in line:
-                    current_prof = "Domain"
-                elif "Private Profile" in line:
-                    current_prof = "Private"
-                elif "Public Profile" in line:
-                    current_prof = "Public"
-                elif current_prof and line.lower().startswith("state"):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        state_val = parts[-1].upper()
-                        result[current_prof]["enabled"] = (state_val == "ON")
-                        print(f"[system_state] Firewall {current_prof}: State={state_val} -> enabled={result[current_prof]['enabled']}")
-                elif current_prof and ("firewall policy" in line.lower() or "firewallpolicy" in line.lower()):
-                    parts = line.split()
-                    if parts:
-                        policy = parts[-1].lower()
-                        if "blockinbound" in policy:
-                            result[current_prof]["inbound"] = "Block"
-                        elif "allowinbound" in policy:
-                            result[current_prof]["inbound"] = "Allow"
-                        if "blockoutbound" in policy:
-                            result[current_prof]["outbound"] = "Block"
-                        elif "allowoutbound" in policy:
-                            result[current_prof]["outbound"] = "Allow"
-
-            if any(result[p].get("enabled") is not None for p in result):
-                return result
-    except Exception as e:
-        print(f"[system_state] netsh firewall error: {e}")
-
-    # === PHUONG PHAP 2: PowerShell fallback ===
-    try:
-        script = r"""
-        $profiles = Get-NetFirewallProfile -ErrorAction SilentlyContinue
-        $out = @()
-        foreach ($p in $profiles) {
-            $enabled = ($p.Enabled -eq $true) -or ($p.Enabled -eq 1) -or ([string]$p.Enabled -eq 'True')
-            $out += "$($p.Name)|$enabled|$($p.DefaultInboundAction)|$($p.DefaultOutboundAction)"
-        }
-        $out -join "`n"
-        """
-        ps_out = _run_ps(script)
-        if ps_out.strip():
-            for line in ps_out.strip().splitlines():
-                parts = line.strip().split("|")
-                if len(parts) >= 2:
-                    name = parts[0].strip()
-                    enabled = parts[1].strip().lower() == "true"
-                    if name in result:
-                        result[name]["enabled"] = enabled
-                        print(f"[system_state] PS Firewall {name}: enabled={enabled}")
-    except Exception as e:
-        print(f"[system_state] PowerShell firewall error: {e}")
-
-    return result
+def detect_network_mode(ip):
+    """Heuristic theo dai IP cua lab VMware (giu tu v1)."""
+    if not ip or ip.count(".") != 3:
+        return "Unknown"
+    if ip.startswith(("192.168.10.", "192.168.146.", "192.168.137.")):
+        return "Host-only"
+    if ip.startswith("192.168.") and ip.split(".")[2] in ("80", "100", "110", "44"):
+        return "NAT"
+    if ip.startswith("100."):
+        return "Tailscale"
+    return "Unknown"
 
 
-def restore_firewall_state(fw_state):
-    """Khoi phuc Windows Firewall ve trang thai luc backup"""
-    if not IS_WINDOWS:
-        print(f"[system_state] (Skip - non-Windows) Restore firewall: {fw_state}")
-        return True
-
-    profile_map = {"Domain": "domain", "Private": "private", "Public": "public"}
-    for prof_name, settings in fw_state.items():
-        netsh_prof = profile_map.get(prof_name)
-        if not netsh_prof:
+def _adapters(raw, want_v4, want_v6):
+    out = []
+    for a in raw or []:
+        if not a.get("v4_ip") and not a.get("v6_ip"):
             continue
-        state = "on" if settings.get("enabled") else "off"
-        _run_cmd(f"netsh advfirewall set {netsh_prof}profile state {state}")
-        print(f"[system_state] Firewall {prof_name} -> {state}")
+        v4 = {"ip": a.get("v4_ip"), "prefix": a.get("v4_prefix"),
+              "subnet_mask": prefix_to_mask(a["v4_prefix"]) if a.get("v4_prefix") is not None else None,
+              "gateway": (_as_list(a.get("v4_gateway")) or [None])[0], "dns": _as_list(a.get("v4_dns")),
+              "dhcp": "enabled" in str(a.get("v4_dhcp", "")).lower()}
+        v6 = {"ip": a.get("v6_ip"), "prefix": a.get("v6_prefix"), "subnet_mask": None,
+              "gateway": (_as_list(a.get("v6_gateway")) or [None])[0], "dns": _as_list(a.get("v6_dns")),
+              "dhcp": "enabled" in str(a.get("v6_dhcp", "")).lower()}
+        item = {"name": a.get("name"), "mac": a.get("mac"), "status": a.get("status"),
+                "index": a.get("index"), "mode": detect_network_mode(v4["ip"])}
+        if want_v4:
+            item["ipv4"] = v4
+            # tuong thich code restore/compare cu doc IPv4 o cap goc
+            item.update({k: v4[k] for k in ("ip", "prefix", "subnet_mask", "gateway", "dns", "dhcp")})
+        if want_v6:
+            item["ipv6"] = v6
+        out.append(item)
+    return out
 
-        inbound = settings.get("inbound", "Block").lower()
-        outbound = settings.get("outbound", "Allow").lower()
-        _run_cmd(f"netsh advfirewall set {netsh_prof}profile firewallpolicy {inbound}inbound,{outbound}outbound")
 
-    return True
+def _firewall_profiles(raw):
+    res = {}
+    for p in raw or []:
+        name = p.get("name")
+        if name not in ("Domain", "Private", "Public"):
+            continue
+        en = str(p.get("enabled", "")).lower()
+        inbound = p.get("inbound") if p.get("inbound") in ("Block", "Allow") else "Block"
+        outbound = p.get("outbound") if p.get("outbound") in ("Block", "Allow") else "Allow"
+        res[name] = {"enabled": en in ("true", "1", "notconfigured"), "inbound": inbound, "outbound": outbound}
+    return res or network_advanced.firewall_profiles_netsh()
 
 
-# ===== WINDOWS DEFENDER =====
+def _routes(raw_routes, route_print):
+    routes, seen = [], set()
+    for r in raw_routes or []:
+        dest, _, plen = str(r.get("prefix", "")).partition("/")
+        item = {"destination": dest, "mask": prefix_to_mask(plen or 32), "gateway": r.get("next_hop"),
+                "metric": r.get("metric", 1), "persistent": True}
+        key = (item["destination"], item["mask"], item["gateway"])
+        if dest and key not in seen:
+            seen.add(key)
+            routes.append(item)
+    for item in network_advanced.parse_route_print(route_print or ""):
+        key = (item["destination"], item["mask"], item["gateway"])
+        if key not in seen:
+            seen.add(key)
+            routes.append(item)
+    return routes
 
-def get_defender_state():
-    """Lay trang thai Windows Defender"""
+
+def _read_hosts():
     if not IS_WINDOWS:
-        return {"realtime_enabled": True, "available": False}
-
-    script = """
-    try {
-        $pref = Get-MpPreference -ErrorAction Stop
-        @{
-            realtime_enabled = -not $pref.DisableRealtimeMonitoring
-            behavior_enabled = -not $pref.DisableBehaviorMonitoring
-            ioav_enabled = -not $pref.DisableIOAVProtection
-            available = $true
-        } | ConvertTo-Json -Compress
-    } catch {
-        @{ available = $false } | ConvertTo-Json -Compress
-    }
-    """
-    out = _run_ps(script)
+        return ""
     try:
-        return json.loads(out) if out.strip() else {"available": False}
-    except json.JSONDecodeError:
-        return {"available": False}
+        with open(HOSTS_PATH, encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    except OSError as e:
+        log.warning("Khong doc duoc hosts: %s", e)
+        return ""
 
 
-def restore_defender_state(def_state):
-    """Khoi phuc Windows Defender ve trang thai luc backup"""
-    if not IS_WINDOWS:
-        print(f"[system_state] (Skip - non-Windows) Restore defender: {def_state}")
-        return True
-
-    if not def_state.get("available"):
-        print("[system_state] Defender khong kha dung, bo qua")
-        return True
-
-    rt = "$false" if def_state.get("realtime_enabled") else "$true"
-    bh = "$false" if def_state.get("behavior_enabled") else "$true"
-    io = "$false" if def_state.get("ioav_enabled") else "$true"
-
-    script = f"""
-    try {{
-        Set-MpPreference -DisableRealtimeMonitoring {rt} -ErrorAction SilentlyContinue
-        Set-MpPreference -DisableBehaviorMonitoring {bh} -ErrorAction SilentlyContinue
-        Set-MpPreference -DisableIOAVProtection {io} -ErrorAction SilentlyContinue
-        Write-Output "OK"
-    }} catch {{
-        Write-Output "FAIL: $_"
-    }}
+def capture_system_state(components=None):
     """
-    out = _run_ps(script)
-    print(f"[system_state] Defender restore: {out.strip()}")
-    return True
+    Ghi nhan cau hinh cho cac thanh phan duoc chon (None = tat ca).
+    Ket qua co cung cau truc voi ban v1 goc da loc theo thanh phan
+    (khoa nao khong co nghia la thanh phan do khong duoc backup).
+    """
+    comps = [c for c in (components or NETWORK_COMPONENTS)]
+    state = {"platform": platform.platform(), "hostname": platform.node(), "components": list(comps)}
+    want = set()
+    if "ipv4" in comps or "ipv6" in comps:
+        want.add("adapters")
+    for c in ("firewall", "defender", "route", "shares", "portproxy"):
+        if c in comps:
+            want.add(c)
 
+    data = {}
+    if want and IS_WINDOWS:
+        out, _ = run_ps(_PS_CAPTURE.replace("__WANT__", ",".join(f"'{w}'" for w in sorted(want))))
+        try:
+            data = json.loads(out) if out.strip() else {}
+        except json.JSONDecodeError:
+            log.warning("Khong doc duoc JSON tu PowerShell: %s", out[:200])
 
-# ===== TONG HOP =====
+    if "adapters" in want:
+        state["adapters"] = _adapters(data.get("adapters"), "ipv4" in comps, "ipv6" in comps)
+    if "firewall" in comps:
+        state["firewall"] = _firewall_profiles(data.get("firewall_profiles"))
+    if "defender" in comps:
+        state["defender"] = data.get("defender") or {"available": False}
 
-def capture_system_state():
-    """Capture toan bo system state"""
-    state = {
-        "platform": platform.platform(),
-        "hostname": platform.node(),
-        "adapters": get_network_adapters(),
-        "firewall": get_firewall_state(),
-        "defender": get_defender_state()
-    }
-    # Cau hinh mang nang cao: routing, hosts, firewall rules, shares, port proxy
-    try:
-        import network_advanced
-        state["network_advanced"] = network_advanced.capture_network_advanced()
-    except Exception as e:
-        print(f"[system_state] Khong capture duoc network_advanced: {e}")
-        state["network_advanced"] = {}
+    na = {}
+    if "route" in comps:
+        na["routing_table"] = _routes(data.get("routes"), data.get("route_print"))
+    if "hosts" in comps:
+        na["hosts_file"] = _read_hosts()
+    if "firewall" in comps:
+        na["firewall_rules"] = [{"name": r.get("Name", ""), "direction": r.get("Direction", ""),
+                                 "action": r.get("Action", ""), "protocol": r.get("Protocol", ""),
+                                 "localport": r.get("LocalPort", ""), "remoteport": r.get("RemotePort", ""),
+                                 "profile": r.get("Profile", ""), "enabled": True}
+                                for r in data.get("firewall_rules") or []]
+    if "shares" in comps:
+        na["network_shares"] = [{"name": s.get("Name", ""), "path": s.get("Path", ""),
+                                 "description": s.get("Description") or ""} for s in data.get("shares") or []]
+    if "portproxy" in comps:
+        na["port_proxy"] = network_advanced.parse_portproxy(data.get("portproxy_text") or "")
+    if na:
+        state["network_advanced"] = na
     return state
 
 
+# ===================================================================== khoi phuc (lenh giu tu v1)
+
+def restore_network_adapter(a):
+    if not IS_WINDOWS:
+        log.info("(bo qua - khong phai Windows) restore adapter %s", a.get("name"))
+        return True
+    name = safe_arg(a.get("name"))
+    if not name:
+        return False
+    ipv4 = a.get("ipv4")
+    if ipv4 is None and a.get("ip") is not None:          # dinh dang cu
+        ipv4 = {k: a.get(k) for k in ("ip", "prefix", "gateway", "dns", "dhcp", "subnet_mask")}
+    if ipv4 and (ipv4.get("ip") or ipv4.get("dhcp")):
+        _restore_ipv4(name, ipv4)
+    ipv6 = a.get("ipv6")
+    if ipv6 and (ipv6.get("ip") or ipv6.get("dhcp")):
+        _restore_ipv6(name, ipv6)
+    return True
+
+
+def _restore_ipv4(name, v4):
+    if v4.get("dhcp"):
+        run_cmd(f'netsh interface ipv4 set address name="{name}" source=dhcp')
+        run_cmd(f'netsh interface ipv4 set dnsservers name="{name}" source=dhcp')
+        log.info("%s IPv4 -> DHCP", name)
+        return
+    ip = safe_arg(v4.get("ip"))
+    if not ip:
+        return
+    mask = safe_arg(v4.get("subnet_mask") or prefix_to_mask(v4.get("prefix") or 24))
+    cmd = f'netsh interface ipv4 set address name="{name}" static {ip} {mask}'
+    if v4.get("gateway"):
+        cmd += f" {safe_arg(v4['gateway'])} 1"
+    run_cmd(cmd)
+    log.info("%s IPv4 -> %s/%s gw=%s", name, ip, mask, v4.get("gateway"))
+    dns = [safe_arg(d) for d in v4.get("dns") or []]
+    if dns:
+        run_cmd(f'netsh interface ipv4 set dnsservers name="{name}" static {dns[0]} primary')
+        for i, d in enumerate(dns[1:], 2):
+            run_cmd(f'netsh interface ipv4 add dnsservers name="{name}" {d} index={i}')
+
+
+def _restore_ipv6(name, v6):
+    if v6.get("dhcp"):
+        run_cmd(f'netsh interface ipv6 set interface "{name}" routerdiscovery=enabled')
+        run_cmd(f'netsh interface ipv6 set dnsservers name="{name}" source=dhcp')
+        log.info("%s IPv6 -> DHCP/autoconfig", name)
+        return
+    ip = safe_arg(v6.get("ip"))
+    if not ip or ip.lower().startswith("fe80"):
+        return
+    prefix = safe_arg(v6.get("prefix") or 64)
+    run_cmd(f'netsh interface ipv6 set address interface="{name}" address={ip}/{prefix}')
+    if v6.get("gateway"):
+        run_cmd(f'netsh interface ipv6 add route ::/0 "{name}" {safe_arg(v6["gateway"])}')
+    dns = [safe_arg(d) for d in v6.get("dns") or []]
+    if dns:
+        run_cmd(f'netsh interface ipv6 set dnsservers name="{name}" static {dns[0]} primary')
+        for i, d in enumerate(dns[1:], 2):
+            run_cmd(f'netsh interface ipv6 add dnsservers name="{name}" {d} index={i}')
+    log.info("%s IPv6 -> %s/%s", name, ip, prefix)
+
+
+def restore_firewall_state(fw):
+    if not IS_WINDOWS:
+        return True
+    for prof, s in fw.items():
+        p = {"Domain": "domain", "Private": "private", "Public": "public"}.get(prof)
+        if not p:
+            continue
+        run_cmd(f"netsh advfirewall set {p}profile state {'on' if s.get('enabled') else 'off'}")
+        inbound = "block" if str(s.get("inbound", "Block")).lower() == "block" else "allow"
+        outbound = "block" if str(s.get("outbound", "Allow")).lower() == "block" else "allow"
+        run_cmd(f"netsh advfirewall set {p}profile firewallpolicy {inbound}inbound,{outbound}outbound")
+        log.info("Firewall %s -> %s", prof, "on" if s.get("enabled") else "off")
+    return True
+
+
+def restore_defender_state(d):
+    if not IS_WINDOWS or not d.get("available"):
+        return True
+    flag = {True: "$false", False: "$true"}
+    script = (f"Set-MpPreference -DisableRealtimeMonitoring {flag[bool(d.get('realtime_enabled'))]} -ErrorAction SilentlyContinue;"
+              f"Set-MpPreference -DisableBehaviorMonitoring {flag[bool(d.get('behavior_enabled'))]} -ErrorAction SilentlyContinue;"
+              f"Set-MpPreference -DisableIOAVProtection {flag[bool(d.get('ioav_enabled'))]} -ErrorAction SilentlyContinue")
+    run_ps(script)
+    log.info("Defender -> realtime=%s", d.get("realtime_enabled"))
+    return True
+
+
 def restore_system_state(state):
-    """Khoi phuc system state.
-    Chi khoi phuc thanh phan CO trong backup (ho tro backup chon loc:
-    tick muc nao thi chi muc do co trong state -> chi muc do duoc restore).
-    """
+    """Chi khoi phuc thanh phan CO trong ban backup."""
+    steps = []
     if "adapters" in state:
-        print("[system_state] Restoring network adapters...")
-        for adapter in state.get("adapters", []):
-            try:
-                restore_network_adapter(adapter)
-            except Exception as e:
-                print(f"  Error restoring {adapter.get('name')}: {e}")
-
+        steps += [(f"card {a.get('name')}", restore_network_adapter, a) for a in state["adapters"]]
     if "firewall" in state:
-        print("[system_state] Restoring firewall...")
-        try:
-            restore_firewall_state(state.get("firewall", {}))
-        except Exception as e:
-            print(f"  Error: {e}")
-
+        steps.append(("firewall", restore_firewall_state, state["firewall"]))
     if "defender" in state:
-        print("[system_state] Restoring defender...")
+        steps.append(("defender", restore_defender_state, state["defender"]))
+    for label, fn, arg in steps:
         try:
-            restore_defender_state(state.get("defender", {}))
-        except Exception as e:
-            print(f"  Error: {e}")
-
-    # Khoi phuc cau hinh mang nang cao (routing/hosts/shares/portproxy/firewall rules)
+            fn(arg)
+        except Exception as e:          # noqa: BLE001 - mot muc loi khong chan cac muc khac
+            log.error("Khoi phuc %s loi: %s", label, e)
     if state.get("network_advanced"):
-        try:
-            import network_advanced
-            network_advanced.restore_network_advanced(state["network_advanced"])
-        except Exception as e:
-            print(f"[system_state] Loi restore network_advanced: {e}")
+        network_advanced.restore_network_advanced(state["network_advanced"])
 
 
 def compare_system_state(backup_state, current_state):
-    """So sanh system state luc backup vs hien tai"""
+    """Danh sach khac biet (chuoi) giua luc backup va hien tai."""
     diffs = []
-
-    # Network adapter
-    backup_adapters = {a["name"]: a for a in backup_state.get("adapters", [])}
-    current_adapters = {a["name"]: a for a in current_state.get("adapters", [])}
-
-    for name, b_adapter in backup_adapters.items():
-        c_adapter = current_adapters.get(name)
-        if not c_adapter:
-            diffs.append(f"Adapter '{name}' khong ton tai luc restore")
+    cur = {a["name"]: a for a in current_state.get("adapters", [])}
+    for b in backup_state.get("adapters", []):
+        name = b["name"]
+        c = cur.get(name)
+        if not c:
+            diffs.append(f"Card '{name}' không còn tồn tại")
             continue
-        if b_adapter.get("mode") != c_adapter.get("mode"):
-            diffs.append(f"Adapter '{name}': mode {c_adapter.get('mode')} -> {b_adapter.get('mode')}")
-
-        # So sanh IPv4
-        b_v4 = b_adapter.get("ipv4") or {
-            "ip": b_adapter.get("ip"), "dhcp": b_adapter.get("dhcp")}
-        c_v4 = c_adapter.get("ipv4") or {
-            "ip": c_adapter.get("ip"), "dhcp": c_adapter.get("dhcp")}
-        if b_v4.get("ip") != c_v4.get("ip"):
-            diffs.append(f"Adapter '{name}': IPv4 dia chi {c_v4.get('ip')} -> {b_v4.get('ip')}")
-        if b_v4.get("subnet_mask") != c_v4.get("subnet_mask"):
-            diffs.append(f"Adapter '{name}': IPv4 subnet mask {c_v4.get('subnet_mask')} -> {b_v4.get('subnet_mask')}")
-        if b_v4.get("dhcp") != c_v4.get("dhcp"):
-            diffs.append(f"Adapter '{name}': IPv4 DHCP {c_v4.get('dhcp')} -> {b_v4.get('dhcp')}")
-        if b_v4.get("gateway") != c_v4.get("gateway"):
-            diffs.append(f"Adapter '{name}': IPv4 default gateway {c_v4.get('gateway')} -> {b_v4.get('gateway')}")
-
-        # So sanh IPv6
-        b_v6 = b_adapter.get("ipv6") or {}
-        c_v6 = c_adapter.get("ipv6") or {}
-        if b_v6.get("ip") != c_v6.get("ip"):
-            diffs.append(f"Adapter '{name}': IPv6 dia chi {c_v6.get('ip')} -> {b_v6.get('ip')}")
-        if b_v6.get("gateway") != c_v6.get("gateway"):
-            diffs.append(f"Adapter '{name}': IPv6 default gateway {c_v6.get('gateway')} -> {b_v6.get('gateway')}")
-        if b_v6.get("dhcp") != c_v6.get("dhcp"):
-            diffs.append(f"Adapter '{name}': IPv6 DHCP {c_v6.get('dhcp')} -> {b_v6.get('dhcp')}")
-
-    # Firewall
-    for prof in ["Domain", "Private", "Public"]:
-        b_fw = backup_state.get("firewall", {}).get(prof, {})
-        c_fw = current_state.get("firewall", {}).get(prof, {})
-        if b_fw.get("enabled") != c_fw.get("enabled"):
-            diffs.append(f"Firewall {prof}: {c_fw.get('enabled')} -> {b_fw.get('enabled')}")
-
-    # Defender
-    b_def = backup_state.get("defender", {})
-    c_def = current_state.get("defender", {})
-    if b_def.get("realtime_enabled") != c_def.get("realtime_enabled"):
-        diffs.append(f"Defender realtime: {c_def.get('realtime_enabled')} -> {b_def.get('realtime_enabled')}")
-
-    # Network advanced
+        for fam in ("ipv4", "ipv6"):
+            bv, cv = b.get(fam), c.get(fam) or {}
+            if bv is None:
+                continue
+            for k, label in (("ip", "địa chỉ"), ("subnet_mask", "subnet mask"), ("gateway", "gateway"), ("dhcp", "DHCP")):
+                if fam == "ipv6" and k == "subnet_mask":
+                    continue
+                if bv.get(k) != cv.get(k):
+                    diffs.append(f"Card '{name}' {fam.upper()} {label}: {cv.get(k)} -> {bv.get(k)}")
+    for prof, bfw in backup_state.get("firewall", {}).items():
+        cfw = current_state.get("firewall", {}).get(prof, {})
+        if bfw.get("enabled") != cfw.get("enabled"):
+            diffs.append(f"Firewall {prof}: {cfw.get('enabled')} -> {bfw.get('enabled')}")
+    if "defender" in backup_state:
+        bd, cd = backup_state["defender"], current_state.get("defender", {})
+        if bd.get("realtime_enabled") != cd.get("realtime_enabled"):
+            diffs.append(f"Defender realtime: {cd.get('realtime_enabled')} -> {bd.get('realtime_enabled')}")
     if backup_state.get("network_advanced") and current_state.get("network_advanced"):
-        try:
-            import network_advanced
-            na_diffs = network_advanced.compare_network_advanced(
-                backup_state["network_advanced"],
-                current_state["network_advanced"]
-            )
-            diffs.extend(na_diffs)
-        except Exception as e:
-            print(f"[system_state] Loi compare network_advanced: {e}")
-
+        diffs += network_advanced.compare_network_advanced(backup_state["network_advanced"],
+                                                           current_state["network_advanced"])
     return diffs
 
 
 if __name__ == "__main__":
-    state = capture_system_state()
-    print(json.dumps(state, indent=2, default=str))
+    import sys
+    import time
+    t = time.perf_counter()
+    st = capture_system_state(sys.argv[1:] or None)
+    print(json.dumps(st, indent=2, ensure_ascii=False, default=str))
+    print(f"# {time.perf_counter() - t:.2f} s", file=sys.stderr)
