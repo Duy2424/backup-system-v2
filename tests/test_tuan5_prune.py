@@ -11,7 +11,7 @@ from tests.core_helpers import file_hashes, new_repo, reopen, write
 
 
 def snap(i, t, host="PC"):
-    return {"id": f"{i:064x}", "time": t.isoformat(), "host": host, "sources": ["D:\Data"]}
+    return {"id": f"{i:064x}", "time": t.isoformat(), "host": host, "sources": [r"D:\Data"]}
 
 
 def test_chon_ban_giu_kieu_restic():
