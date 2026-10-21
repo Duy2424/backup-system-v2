@@ -159,6 +159,24 @@ def cmd_check(args):
     return 0
 
 
+def cmd_prune(args):
+    from core.prune import POLICY_DEFAULT, plan_prune, run_prune
+    repo = Repository.open(_backend(args), _password(args))
+    policy = {k: getattr(args, f"keep_{k}") for k in POLICY_DEFAULT}
+    plan = plan_prune(repo, policy)
+    print(f"Giữ {len(plan.keep)} snapshot, xoá {len(plan.forget)} snapshot hết hạn "
+          f"(chính sách: {policy['hourly']} giờ / {policy['daily']} ngày / {policy['weekly']} tuần / {policy['monthly']} tháng)")
+    for sid in plan.forget:
+        print(f"  - xoá {sid[:12]}")
+    print(f"Pack: xoá {len(plan.delete_packs)} ({vn_mb(plan.bytes_free)}), chép lại {len(plan.repack)} ({vn_mb(plan.bytes_repack)})")
+    if not args.apply:
+        print("CHẠY THỬ - chưa xoá gì. Dừng dịch vụ API kho rồi chạy lại với --apply.")
+        return 0
+    freed = run_prune(repo, plan)
+    print(f"Xong: giải phóng {vn_mb(freed)}, kho đã được kiểm tra lại.")
+    return 0
+
+
 def main(argv=None):
     _console()
     ap = argparse.ArgumentParser(prog="python -m core", description="Backup v2: chia mẩu + khử trùng lặp + AES-GCM")
@@ -207,6 +225,12 @@ def main(argv=None):
     p = sub.add_parser("snapshots", parents=[common], help="liệt kê snapshot")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_snapshots)
+
+    p = sub.add_parser("prune", parents=[common], help="giữ theo chính sách + dọn kho (chạy cục bộ trên máy giữ kho)")
+    for k, v in (("hourly", 24), ("daily", 7), ("weekly", 4), ("monthly", 3)):
+        p.add_argument(f"--keep-{k}", type=int, default=v)
+    p.add_argument("--apply", action="store_true", help="xoá thật (mặc định chỉ chạy thử)")
+    p.set_defaults(fn=cmd_prune)
 
     p = sub.add_parser("check", parents=[common], help="kiểm tra toàn vẹn")
     p.add_argument("--fast", action="store_true", help="không giải mã từng mẩu")

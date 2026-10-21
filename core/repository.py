@@ -180,7 +180,8 @@ class Repository:
 
     # ================================================================= backup
     def backup(self, paths, host=None, user=None, tags=(), parent="auto", excludes=(),
-               progress=None, cancel=None):
+               progress=None, cancel=None, when=None):
+        """when: thoi diem ghi vao snapshot (mac dinh bay gio; test/nhap du lieu cu dung)."""
         t0 = time.perf_counter()
         sources = [os.path.abspath(p) for p in paths]
         host, user = host or platform.node(), user or getpass.getuser()
@@ -298,7 +299,8 @@ class Repository:
 
         st["seconds"] = round(time.perf_counter() - t0, 3)
         snap = {
-            "version": FORMAT_VERSION, "time": now_iso(), "host": host, "user": user,
+            "version": FORMAT_VERSION, "time": when.astimezone().isoformat(timespec="milliseconds") if when else now_iso(),
+            "host": host, "user": user,
             "roots": [{"name": n, "source": s} for n, s in zip(root_names(sources), sources)],
             "parent": parent_id, "tags": list(tags), "chunker": self.params.to_dict(),
             "stats": st, "tree": tree, "errors": errors[:500],
