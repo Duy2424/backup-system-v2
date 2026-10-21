@@ -81,9 +81,17 @@ def cmd_init(args):
 
 def cmd_backup(args):
     repo = Repository.open(_backend(args), _password(args))
-    res = repo.backup(args.paths, host=args.host, tags=args.tag or (), excludes=args.exclude or (),
-                      parent="auto" if args.parent is None else (None if args.parent == "none" else args.parent),
-                      progress=None if args.quiet else _progress)
+    from core.anomaly import AnomalyDetected
+    try:
+        res = repo.backup(args.paths, host=args.host, tags=args.tag or (), excludes=args.exclude or (),
+                          parent="auto" if args.parent is None else (None if args.parent == "none" else args.parent),
+                          progress=None if args.quiet else _progress, canaries=args.canary or (), force=args.force)
+    except AnomalyDetected as e:
+        print(f"
+DỪNG: {e}", file=sys.stderr)
+        print(json.dumps(e.report, ensure_ascii=False, indent=1))
+        _notify(args, {"type": "anomaly", **e.report})
+        return 4
     if not args.quiet:
         sys.stderr.write("\n")
     if args.json:
@@ -110,6 +118,32 @@ def cmd_restore(args):
     print(f"Khôi phục {sid[:12]} -> {args.target}: {vn_int(st['files'])} file, {vn_int(st['dirs'])} thư mục, "
           f"{vn_mb(st['bytes'])}, tải {vn_mb(st['bytes_downloaded'])} từ {st['packs_read']} pack, "
           f"{vn_int(st.get('verified', 0))} file khớp SHA-256, {vn_num(st['seconds'], 2)} giây")
+
+
+def _notify(args, payload):
+    """Gui bao cao JSON toi webhook (vd bot Telegram cua Nguoi B). Loi mang khong lam hong lenh chinh."""
+    url = getattr(args, "notify_url", None)
+    if not url:
+        return
+    try:
+        import requests
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:     # noqa: BLE001
+        print(f"(không gửi được thông báo tới {url}: {e})", file=sys.stderr)
+
+
+def cmd_verify(args):
+    repo = Repository.open(_backend(args), _password(args))
+    rep = repo.verify_restore(args.snapshot, sample=args.sample)
+    print(f"Khôi phục thử {rep['snapshot'][:12]} ({rep['snapshot_time']}): {rep['ok']}/{rep['checked']} file khớp "
+          f"SHA-256, {vn_mb(rep['bytes'])}, {vn_num(rep['seconds'], 1)} giây -> {rep['result']}")
+    for f in rep["failed"]:
+        print(f"  LỖI {f['path']}: {f['error']}")
+    if args.report:
+        with open(args.report, "w", encoding="utf-8") as f:
+            json.dump(rep, f, ensure_ascii=False, indent=1)
+    _notify(args, {"type": "verify", **rep})
+    return 0 if rep["result"] == "OK" else 1
 
 
 def cmd_ls(args):
@@ -207,7 +241,17 @@ def main(argv=None):
     p.add_argument("--parent", help="snapshot cha (mặc định tự tìm; 'none' = đọc lại hết)")
     p.add_argument("--json", action="store_true")
     p.add_argument("--quiet", action="store_true")
+    p.add_argument("--canary", action="append", help="mẫu tên file mồi (mặc định ~bks_canary*)")
+    p.add_argument("--force", action="store_true", help="vẫn sao lưu dù cổng chặn báo bất thường")
+    p.add_argument("--notify-url", help="webhook nhận cảnh báo JSON (bot Telegram)")
     p.set_defaults(fn=cmd_backup)
+
+    p = sub.add_parser("verify", parents=[common], help="khôi phục thử ngẫu nhiên vài file, so SHA-256 (hằng tuần)")
+    p.add_argument("snapshot", nargs="?", default="latest")
+    p.add_argument("--sample", type=int, default=30)
+    p.add_argument("--report", help="ghi báo cáo JSON")
+    p.add_argument("--notify-url", help="webhook nhận báo cáo JSON (bot Telegram)")
+    p.set_defaults(fn=cmd_verify)
 
     p = sub.add_parser("restore", parents=[common], help="khôi phục")
     p.add_argument("snapshot", nargs="?", default="latest", help="ID (hoặc vài ký tự đầu) / latest")

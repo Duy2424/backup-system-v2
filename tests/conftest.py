@@ -1,10 +1,17 @@
 """Fixture dung chung: server that (werkzeug) chay trong thread voi thu muc tam rieng."""
+import sys
 import threading
 
 import pytest
 from werkzeug.serving import make_server
 
 from shared import config, database
+
+for _s in (sys.stdout, sys.stderr):      # in tieng Viet ra console cp1252 (Git Bash) khong loi
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 
 @pytest.fixture()

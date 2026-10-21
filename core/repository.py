@@ -26,7 +26,7 @@ from datetime import datetime
 
 import zstandard
 
-from core import FORMAT_VERSION, packer
+from core import FORMAT_VERSION, anomaly, packer
 from core.chunker import ChunkerParams, iter_chunks
 from core.crypto import Keys, key_id, make_key_file, open_key_file, sha256_hex
 from core.errors import Cancelled, IntegrityError, NotFound, RepoError, WrongPassword
@@ -180,7 +180,7 @@ class Repository:
 
     # ================================================================= backup
     def backup(self, paths, host=None, user=None, tags=(), parent="auto", excludes=(),
-               progress=None, cancel=None, when=None):
+               progress=None, cancel=None, when=None, gate=True, thresholds=None, canaries=None, force=False):
         """when: thoi diem ghi vao snapshot (mac dinh bay gio; test/nhap du lieu cu dung)."""
         t0 = time.perf_counter()
         sources = [os.path.abspath(p) for p in paths]
@@ -200,6 +200,15 @@ class Repository:
             parent_id = self.resolve(parent)
             parent_snap = self.load_snapshot(parent_id)
         cache = FileCache.from_snapshot(parent_snap)
+
+        # Cong chan bat thuong: TRUOC khi doc/gui du lieu (can snapshot cha de so sanh)
+        anomaly_report = None
+        if gate and parent_snap is not None:
+            anomaly_report = anomaly.assess(entries, parent_snap, cache, thresholds, canaries)
+            if anomaly_report["alarm"]:
+                log.error("BẤT THƯỜNG: %s", "; ".join(anomaly_report["reasons"]))
+                if not force:
+                    raise anomaly.AnomalyDetected(anomaly_report)
 
         st = dict(files=0, dirs=0, bytes=0, files_cached=0, files_read=0, bytes_read=0, chunks=0,
                   chunks_new=0, bytes_new=0, packs_new=0, bytes_uploaded=0)
@@ -305,13 +314,15 @@ class Repository:
             "parent": parent_id, "tags": list(tags), "chunker": self.params.to_dict(),
             "stats": st, "tree": tree, "errors": errors[:500],
         }
+        if anomaly_report is not None:
+            snap["anomaly"] = {k: v for k, v in anomaly_report.items() if k != "examples"}
         sid, snap_size = self.save_snapshot(snap)          # luon la buoc CUOI
         st["bytes_uploaded"] += snap_size
         log.info("Ghi snapshot %s (%d file, mẩu mới %d/%d, %d pack mới)", sid[:12], st["files"],
                  st["chunks_new"], st["chunks"], st["packs_new"])
         st["seconds"] = round(time.perf_counter() - t0, 3)
         prog.final("xong")
-        return {"snapshot_id": sid, "parent": parent_id, "stats": st, "errors": errors}
+        return {"snapshot_id": sid, "parent": parent_id, "stats": st, "errors": errors, "anomaly": anomaly_report}
 
     # ================================================================= duyet / restore
     def ls(self, snapshot_id, prefix=None):
@@ -396,6 +407,40 @@ class Repository:
                   seconds=round(time.perf_counter() - t0, 3))
         prog.final("xong")
         return st
+
+    # ================================================================= khoi phuc thu (tuan 6)
+    def verify_restore(self, snapshot="latest", sample=30, workdir=None, seed=None):
+        """Khoi phuc thu file lon nhat + ngau nhien `sample` file ra thu muc tam, so SHA-256, roi xoa."""
+        import random
+        import shutil
+        import tempfile
+        t0 = time.perf_counter()
+        sid = self.resolve(snapshot)
+        snap = self.load_snapshot(sid)
+        files = [e for e in snap["tree"] if e["type"] == "file"]
+        rng = random.Random(seed)
+        picked = sorted(files, key=lambda e: e["size"], reverse=True)[:1]
+        rest = [e for e in files if e not in picked]
+        picked += rng.sample(rest, min(max(sample - 1, 0), len(rest)))
+        tmp = tempfile.mkdtemp(prefix="bks-verify-", dir=workdir)
+        ok, failed, nbytes = 0, [], 0
+        try:
+            for e in picked:
+                try:
+                    self.restore(sid, tmp, include=e["path"])
+                    with open(long_path(os.path.join(tmp, *e["path"].split("/"))), "rb") as f:
+                        h = hashlib.sha256(f.read()).hexdigest()
+                    if e.get("sha256") and h != e["sha256"]:
+                        raise IntegrityError("SHA-256 không khớp")
+                    ok += 1
+                    nbytes += e["size"]
+                except (IntegrityError, RepoError, OSError) as ex:
+                    failed.append({"path": e["path"], "error": str(ex)})
+        finally:
+            shutil.rmtree(long_path(tmp), ignore_errors=True)
+        return {"result": "OK" if not failed else "LỖI", "snapshot": sid, "snapshot_time": snap["time"],
+                "host": snap["host"], "checked": len(picked), "ok": ok, "failed": failed, "bytes": nbytes,
+                "seconds": round(time.perf_counter() - t0, 2), "at": now_iso()}
 
     # ================================================================= check
     def check(self, read_data=True, progress=None):

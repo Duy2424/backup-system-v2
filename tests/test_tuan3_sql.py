@@ -87,3 +87,9 @@ def test_register_tasks_3_lich():
     assert "BackupSQL-Log [moi 15 phut]" in out
     assert "-Mode Log -Database ShopDB" in out and "grant_system.sql -v DB=ShopDB" in out
     assert "RUN \\BackupSystem\\BackupSQL-Full" in out
+
+
+def test_khoi_phuc_thu_sql_hang_tuan():
+    out = ps("verify_sql_restore.ps1", "-Database", "ShopDB", "-BackupDir", r"D:\SQLBackup")
+    assert "restore_pitr.ps1 -Database ShopDB" in out and "-TargetDatabase ShopDB_kiemtra" in out
+    assert "DBCC CHECKDB ([ShopDB_kiemtra])" in out and "DROP DATABASE [ShopDB_kiemtra]" in out
