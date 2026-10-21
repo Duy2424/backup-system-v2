@@ -72,6 +72,17 @@ AGENT_POLL_INTERVAL = float(_env("BACKUP_POLL_INTERVAL", _agent_cfg.get("POLL_IN
 BROWSER_HOST = _env("BACKUP_BROWSER_HOST", _agent_cfg.get("BROWSER_HOST", "127.0.0.1"))
 BROWSER_PORT = int(_env("BACKUP_BROWSER_PORT", _agent_cfg.get("BROWSER_PORT", "5001")))
 
+# ===== AGENT: dong co v2 (chia mau + khu trung lap + AES-GCM) =====
+# ENGINE=v2 trong agent_config.txt -> job sao luu/khoi phuc tren web chay bang core/ (kho v2).
+# Mat khau kho nam o MAY AGENT (file V2_PASSWORD_FILE), server khong bao gio giu khoa.
+ENGINE = _env("BACKUP_ENGINE", _agent_cfg.get("ENGINE", "v1")).lower()
+V2_REPO = _env("BACKUP_V2_REPO", _agent_cfg.get("V2_REPO", ""))
+V2_PASSWORD_FILE = _env("BACKUP_V2_PASSWORD_FILE", _agent_cfg.get("V2_PASSWORD_FILE", ""))
+V2_CERT = _agent_cfg.get("V2_CERT", "")
+V2_KEY = _agent_cfg.get("V2_KEY", "")
+V2_CA = _agent_cfg.get("V2_CA", "")
+V2_LIMIT_SCHEDULE = _agent_cfg.get("V2_LIMIT_SCHEDULE", "")
+
 # ===== THANH PHAN BACKUP =====
 # Tick muc nao thi chi backup/restore muc do; tick het = backup toan bo.
 BACKUP_COMPONENTS = [

@@ -372,6 +372,10 @@ export function backupsView(ctx, param) {
       ["Thời gian chạy", st.seconds != null ? fmtDuration(st.seconds) : "–"],
     ];
     if (st.skipped) facts.push(["File bỏ qua", `${fmtInt(st.skipped)} (không đọc được)`]);
+    if (st.engine === "v2") {
+      facts[4] = ["Dữ liệu mới gửi lên kho", fmtBytes(b.size)];
+      facts.push(["Động cơ", "v2 (khử trùng lặp, AES-GCM)"], ["Mẩu mới / tổng", `${fmtInt(st.chunks_new)} / ${fmtInt(st.chunks)}`]);
+    }
     return h("tr", { class: "detail" }, h("td", { colspan: "6" }, h("div", { class: "detail-grid" },
       h("div", {},
         h("dl", { class: "facts" }, facts.map(([k, v]) => h("div", {}, h("dt", { text: k }), h("dd", {}, v)))),

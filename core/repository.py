@@ -333,9 +333,19 @@ class Repository:
             tree = [e for e in tree if e["path"] == p or e["path"].startswith(p + "/")]
         return [{k: e.get(k) for k in ("path", "type", "size", "mtime_ns", "sha256")} for e in tree]
 
-    def restore(self, snapshot_id, target, include=None, progress=None, partial=None):
-        """partial (mac dinh = co include): chi tai index + dung cac mau can (Range), khong tai ca pack."""
+    def restore(self, snapshot_id, target=None, include=None, progress=None, partial=None,
+                in_place=False, delete_extra=False, dry_run=False):
+        """
+        target    : khoi phuc ra thu muc nay (<target>/<ten goc>/...).
+        in_place  : khoi phuc VE VI TRI CU (thu muc nguon ghi trong snapshot); file khong doi
+                    (cung size + mtime, hoac cung SHA-256) duoc bo qua.
+        delete_extra (chi in_place): xoa file hien co ma snapshot khong co - mac dinh TAT.
+        dry_run   : chi dem, khong ghi/xoa gi.
+        partial   : (mac dinh = co include) chi tai index + dung mau can (Range), khong tai ca pack.
+        """
         t0 = time.perf_counter()
+        if not in_place and not target:
+            raise ValueError("Cần target hoặc in_place=True")
         snap = self.load_snapshot(snapshot_id)
         tree = snap["tree"]
         if include:
@@ -343,31 +353,53 @@ class Repository:
             tree = [e for e in tree if e["path"] == inc or e["path"].startswith(inc + "/")]
             if not tree:
                 raise NotFound(f"Snapshot không có '{include}'")
+        roots = {r["name"]: r["source"] for r in snap["roots"]}
+        target = os.path.abspath(target) if target else None
+
+        def dest_of(path):
+            parts = path.split("/")
+            if any(p in ("", ".", "..") or ":" in p for p in parts):
+                raise IntegrityError(f"Đường dẫn không an toàn trong snapshot: {path!r}")
+            if in_place:
+                if parts[0] not in roots:
+                    raise IntegrityError(f"Không rõ thư mục gốc của {path!r}")
+                return os.path.join(roots[parts[0]], *parts[1:])
+            return os.path.join(target, *parts)
+
+        def unchanged(dest, e):
+            try:
+                st_ = os.stat(long_path(dest))
+            except OSError:
+                return False
+            if st_.st_size != e["size"]:
+                return False
+            if st_.st_mtime_ns == e["mtime_ns"]:
+                return True
+            if e.get("sha256"):
+                with open(long_path(dest), "rb") as f:
+                    return hashlib.file_digest(f, "sha256").hexdigest() == e["sha256"]
+            return False
+
         files = [e for e in tree if e["type"] == "file"]
-        ids = list(dict.fromkeys(h for e in files for h in e["chunks"]))
+        todo = [e for e in files if not (in_place and unchanged(dest_of(e["path"]), e))]
+        st = {"files": 0, "dirs": 0, "bytes": 0, "unchanged": len(files) - len(todo), "deleted": 0,
+              "to_write": len(todo)}
+        ids = list(dict.fromkeys(h for e in todo for h in e["chunks"]))
         loc = {}
         for i in range(0, len(ids), LOCATE_BATCH):
             loc.update(self.backend.locate_chunks(ids[i:i + LOCATE_BATCH]))
         lost = [h for h in ids if h not in loc]
         if lost:
             raise IntegrityError(f"Kho thiếu {len(lost)} mẩu mà snapshot cần (vd {lost[0][:12]})")
-
-        target = os.path.abspath(target)
         cache = _RangeFetcher(self) if (partial if partial is not None else bool(include)) else _PackCache(self)
-        prog = _Progress(progress, sum(e["size"] for e in files))
-        st = {"files": 0, "dirs": 0, "bytes": 0}
+        prog = _Progress(progress, sum(e["size"] for e in todo))
 
-        def dest_of(path):
-            parts = path.split("/")
-            if any(p in ("", ".", "..") or ":" in p for p in parts):
-                raise IntegrityError(f"Đường dẫn không an toàn trong snapshot: {path!r}")
-            return os.path.join(target, *parts)
-
-        for e in tree:
-            if e["type"] == "dir":
-                os.makedirs(long_path(dest_of(e["path"])), exist_ok=True)
-                st["dirs"] += 1
-        for e in files:
+        if not dry_run:
+            for e in tree:
+                if e["type"] == "dir":
+                    os.makedirs(long_path(dest_of(e["path"])), exist_ok=True)
+                    st["dirs"] += 1
+        for e in ([] if dry_run else todo):
             dest = dest_of(e["path"])
             os.makedirs(long_path(os.path.dirname(dest)), exist_ok=True)
             tmp = dest + ".bks-part"
@@ -397,12 +429,23 @@ class Repository:
             _set_attrs(dest, e.get("attrs", 0))
             st["files"] += 1
             st["bytes"] += size
-        for e in reversed(tree):                 # mtime thu muc dat sau cung (ghi file lam doi mtime)
-            if e["type"] == "dir":
-                try:
-                    os.utime(long_path(dest_of(e["path"])), ns=(e["mtime_ns"], e["mtime_ns"]))
-                except OSError:
-                    pass
+        if in_place and delete_extra:
+            wanted = {e["path"] for e in files}
+            scope = [r for n, r in roots.items() if not include or include.strip("/").split("/")[0] == n]
+            for cur in scan(scope, make_matcher()):
+                in_scope = not include or cur.path == include.strip("/") or cur.path.startswith(include.strip("/") + "/")
+                if cur.type == "file" and in_scope and cur.path not in wanted:
+                    st["deleted"] += 1
+                    if not dry_run:
+                        _make_writable(cur.abs)
+                        os.remove(long_path(cur.abs))
+        if not dry_run:
+            for e in reversed(tree):             # mtime thu muc dat sau cung (ghi file lam doi mtime)
+                if e["type"] == "dir":
+                    try:
+                        os.utime(long_path(dest_of(e["path"])), ns=(e["mtime_ns"], e["mtime_ns"]))
+                    except OSError:
+                        pass
         st.update(packs_read=cache.packs_read, bytes_downloaded=cache.bytes_read,
                   seconds=round(time.perf_counter() - t0, 3))
         prog.final("xong")

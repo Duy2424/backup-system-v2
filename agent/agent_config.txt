@@ -18,3 +18,13 @@
 
 SERVER_URL=http://127.0.0.1:5000
 AGENT_TOKEN=
+
+# ----- Dong co v2 (tuy chon) -----
+# ENGINE=v2 : sao luu bang loi v2 (chi gui phan thay doi). Bo trong / v1 = cach cu (ban 1.5).
+# V2_REPO   : thu muc kho (vd D:\kho-v2) hoac https://<IP Tailscale PC>:<cong> (API kho cua B)
+# V2_PASSWORD_FILE : file chua mat khau kho (KHONG dua len git), vd C:\backup-secrets\kho.txt
+# V2_CERT / V2_KEY / V2_CA : chung chi mTLS khi V2_REPO la https
+# V2_LIMIT_SCHEDULE : file JSON lich gioi han toc do, vd config\gioi_han_toc_do.json
+ENGINE=v1
+V2_REPO=
+V2_PASSWORD_FILE=

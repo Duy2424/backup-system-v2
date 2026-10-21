@@ -105,6 +105,15 @@ set BACKUP_V2_PASSWORD=...                      rem hoặc --password-file, ho�
 
 Khôi phục bản cuối (5.229 file) mất 15,8 s, digest khớp 100% với dữ liệu nguồn.
 
+**Dùng v2 từ giao diện web:** trong `agentgent_config.txt` đặt `ENGINE=v2`, `V2_REPO=` (thư mục kho hoặc
+`https://…` của API kho) và `V2_PASSWORD_FILE=` (file chứa mật khẩu kho, chỉ nằm trên máy agent - server không giữ khoá).
+Nút "Sao lưu" trên web khi đó chạy bằng v2. Cấu hình mạng được ghi thành `v2_he_thong/system_state.json` trong cùng
+snapshot. "Khôi phục" về vị trí cũ thì bỏ qua file không đổi, chỉ xoá file thừa khi bạn bật tuỳ chọn.
+Lệnh liên quan: `python -m core verify` (khôi phục thử hằng tuần), `python -m core prune` (giữ 24 giờ / 7 ngày /
+4 tuần / 3 tháng, chạy thử trước), `python -m agent.netplan` (áp cấu hình mạng sang máy khác, xem trước rồi mới áp).
+Cổng chặn bất thường chạy tự động khi sao lưu: file mồi `~bks_canary*` bị sửa, hoặc nhiều file đổi kèm dấu hiệu
+bị mã hoá → dừng, không gửi gì lên kho.
+
 Qua mạng (tuần 3): `--repo https://<IP Tailscale của PC>:<cổng>` cùng `--cert/--key/--ca` (mTLS), `--limit 2MB/s`
 hoặc `--limit-schedule config\gioi_han_toc_do.json`. Đứt mạng giữa chừng thì client tự thử lại; chạy lại sẽ chỉ gửi
 các mẩu còn thiếu. Checklist chạy thật: [`docs/tuan3-chay-that.md`](docs/tuan3-chay-that.md).

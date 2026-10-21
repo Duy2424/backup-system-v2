@@ -78,9 +78,30 @@ class Reporter:
             raise JobCancelled()
 
 
+_v2 = None
+
+
+def v2_engine():
+    global _v2
+    if _v2 is None:
+        from agent.v2_engine import V2Engine
+        _v2 = V2Engine()
+    return _v2
+
+
 def handle_backup(api, job):
     user, params = job["_user"], job.get("params") or {}
     rep = Reporter(api, job["id"])
+    if config.ENGINE == "v2":
+        from core.anomaly import AnomalyDetected
+        try:
+            payload = v2_engine().backup(params.get("paths"), params.get("components"), progress_cb=rep)
+        except AnomalyDetected as e:
+            raise RuntimeError(f"BẤT THƯỜNG - đã dừng, không gửi gì lên kho: {'; '.join(e.report['reasons'])}") from None
+        api.backup_done(job["id"], payload)
+        s = payload["stats"]
+        return (f"Sao lưu v2 xong: {vn_int(s['files'])} file, mẩu mới {vn_int(s['chunks_new'])}/{vn_int(s['chunks'])}, "
+                f"gửi {vn_mb(s['bytes_uploaded'])}, {vn_num(s['seconds'])} giây")
     result = backup_logic.perform_backup(user, paths=params.get("paths"),
                                          components=params.get("components"), progress_cb=rep)
     api.backup_done(job["id"], {
@@ -98,6 +119,12 @@ def handle_restore(api, job):
     if not params.get("filename"):
         raise ValueError("Job khôi phục thiếu tên file")
     rep = Reporter(api, job["id"])
+    from agent.v2_engine import is_v2_name
+    if is_v2_name(params["filename"]):
+        r = v2_engine().restore(params["filename"], params, progress_cb=rep)
+        head = "Chạy thử" if r["dry_run"] else "Khôi phục v2 xong"
+        return (f"{head}: ghi {vn_int(r['to_add_or_overwrite'])}, giữ nguyên {vn_int(r['unchanged'])}, "
+                f"xoá {vn_int(r['deleted'])}" + ("; đã áp cấu hình hệ thống" if r["system_applied"] else ""))
 
     def progress(p, m):
         rep(p, m)

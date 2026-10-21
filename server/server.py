@@ -639,6 +639,19 @@ def create_app(start_scheduler=False):
             raise ApiError(400, "Job không phải sao lưu", "bad_job")
         d = request.get_json(silent=True) or {}
         filename = str(d.get("filename", ""))
+        if d.get("engine") == "v2":
+            # v2: du lieu nam trong kho v2 (khu trung lap, ma hoa phia agent); server chi luu thong ke
+            if not re.fullmatch(r"v2-[0-9a-f]{64}", filename):
+                raise ApiError(400, "Tên snapshot v2 không hợp lệ", "bad_filename")
+            comps = d.get("components") or []
+            ss = dict(d.get("snapshot_summary") or {}, components=comps)
+            bid = database.create_backup_record(g.agent_user["id"], filename, d.get("paths") or [],
+                                                "full" if set(comps) >= set(config.BACKUP_COMPONENTS) else "selected")
+            database.update_backup(bid, size=int(d.get("size") or 0), status="completed",
+                                   snapshot_summary=json.dumps(ss, ensure_ascii=False),
+                                   stats=json.dumps(dict(d.get("stats") or {}, engine="v2"), ensure_ascii=False))
+            database.update_job(job_id, backup_id=bid)
+            return jsonify({"ok": True, "backup_id": bid})
         if not FILENAME_RE.match(filename):
             raise ApiError(400, "Tên file không hợp lệ", "bad_filename")
         path = os.path.join(user_dir(g.agent_user["id"]), filename)
