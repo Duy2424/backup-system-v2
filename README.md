@@ -127,9 +127,12 @@ SQL Server: [`scripts/sql/`](scripts/sql/) (Full hàng tuần / Diff hàng ngày
 .venv\Scripts\python bench\bench_v1.py --ref v1-goc    rem đo bản đồ án cơ sở gốc
 .venv\Scripts\python bench\bench_v2.py                 rem đo v2 + khôi phục kiểm chứng + bảng so sánh
 .venv\Scripts\python -m pytest -s tests\test_core_required.py   rem 6 test bắt buộc của v2, in số mẩu mới/tổng
+.venv\Scripts\python bench\sweep_v2.py                rem tuần 7: quét kích thước mẩu x mức nén
+.venv\Scripts\python bench\bench_restic.py --restic D:\tools\restic.exe   rem so với restic (tự tải restic)
+.venv\Scripts\python bench\dien_tap.py k5             rem diễn tập: k5 xoá/ghi đè, k6 đứt mạng, k7 băng thông, k8 sửa 1 byte
 ```
 
-Chi tiết: [`bench/README.md`](bench/README.md). Thử VSS trên PC: [`docs/vss-test.md`](docs/vss-test.md).
+Chi tiết: [`bench/README.md`](bench/README.md), thí nghiệm + diễn tập tuần 7: [`docs/tuan7-thi-nghiem.md`](docs/tuan7-thi-nghiem.md). Thử VSS trên PC: [`docs/vss-test.md`](docs/vss-test.md).
 Thử khôi phục cấu hình mạng: thư mục [`test-scripts/`](test-scripts/) (`check_all.bat` → sao lưu → `doi_all.bat` → khôi phục → `check_all.bat`).
 
 ## Cấu trúc thư mục
@@ -141,7 +144,7 @@ backup-system/
 │                      network_advanced.py, sql_registry.py, folder_browser.py, remote_storage.py, winexec.py
 ├── shared/            config.py, database.py, encryption_utils.py, snapshot.py, log.py, text.py
 ├── core/              v2: scanner, chunker, crypto, packer, repo_local, repository, cli (python -m core)
-├── bench/             make_dataset.py, bench_v1.py, results/*.csv
+├── bench/             make_dataset.py, bench_v1/v2.py, sweep_v2.py, bench_restic.py, dien_tap.py, results/*.csv
 ├── tests/             pytest
 ├── docs/              repo-format.md (hợp đồng kho v2), vss-test.md, PRODUCT.md, lich-su/
 ├── scripts/           vss_test.ps1

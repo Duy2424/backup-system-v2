@@ -108,6 +108,39 @@ def process_read_bytes():
     return None
 
 
+class _PowerStatus(ctypes.Structure):
+    _fields_ = [("ACLineStatus", ctypes.c_ubyte), ("BatteryFlag", ctypes.c_ubyte),
+                ("BatteryLifePercent", ctypes.c_ubyte), ("SystemStatusFlag", ctypes.c_ubyte),
+                ("BatteryLifeTime", ctypes.c_ulong), ("BatteryFullLifeTime", ctypes.c_ulong)]
+
+
+def power_note():
+    """'nguon=sac' / 'nguon=pin45%' (Windows) de biet so do lay khi cam sac hay chay pin. May khac -> ''."""
+    if platform.system() != "Windows":
+        return ""
+    st = _PowerStatus()
+    if not ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(st)):
+        return ""
+    if st.ACLineStatus == 1:
+        return "nguon=sac"
+    if st.ACLineStatus == 0:
+        pct = st.BatteryLifePercent
+        return f"nguon=pin{pct}%" if pct <= 100 else "nguon=pin"
+    return ""
+
+
+def warm_read(root, block=4 * 1024 * 1024):
+    """Doc het moi file mot luot (khong tinh gio): file vua sao chep lan dau doc rat cham tren Windows
+    (trinh diet virus quet file moi) -> lam nong de dieu kien giong du lieu vua sinh. Tra ve so byte."""
+    total = 0
+    for dirpath, _dirs, files in os.walk(root):
+        for f in files:
+            with open(os.path.join(dirpath, f), "rb") as fh:
+                for chunk in iter(lambda: fh.read(block), b""):
+                    total += len(chunk)
+    return total
+
+
 def hostname():
     return socket.gethostname()
 

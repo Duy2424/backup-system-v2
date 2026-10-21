@@ -28,7 +28,7 @@ if __package__ in (None, ""):
 
 from bench import make_dataset  # noqa: E402
 from bench.common import (RESULTS_DIR, append_rows, dir_size, fmt_bytes, hostname,  # noqa: E402
-                          now_iso, print_table, process_read_bytes, setup_console)
+                          now_iso, power_note, print_table, process_read_bytes, setup_console)
 from core.repo_local import LocalRepo  # noqa: E402
 from core.repository import init_repo  # noqa: E402
 
@@ -83,7 +83,7 @@ def main(argv=None):
     ds = make_dataset.generate(data, args.size, args.seed)
     print(f"[bench v2] {ds['so_file']} file, {fmt_bytes(ds['tong_byte'])}, digest {ds['digest'][:16]}")
     repo = init_repo(LocalRepo(kho), PASSWORD)
-    note = f"seed={args.seed} size={args.size} digest0={ds['digest'][:12]} kho=local"
+    note = f"seed={args.seed} size={args.size} digest0={ds['digest'][:12]} kho=local {power_note()}".rstrip()
 
     rows = []
     for i in range(1, args.runs + 1):

@@ -67,7 +67,8 @@ class _Progress:
 
 # ===================================================================== init / open
 
-def init_repo(backend, password, params=ChunkerParams(), pack_target=packer.DEFAULT_TARGET, scrypt=None):
+def init_repo(backend, password, params=ChunkerParams(), pack_target=packer.DEFAULT_TARGET, scrypt=None,
+              zstd_level=3):
     """Tao kho moi: key file truoc, config sau cung (config co = kho dung duoc)."""
     try:
         backend.get_config()
@@ -77,7 +78,7 @@ def init_repo(backend, password, params=ChunkerParams(), pack_target=packer.DEFA
     cfg = {
         "format": CONFIG_FORMAT, "version": FORMAT_VERSION, "repo_id": secrets.token_hex(16),
         "created": now_iso(), "chunker": params.to_dict(), "pack_target_size": int(pack_target),
-        "compression": {"algorithm": "zstd", "level": 3}, "cipher": "AES-256-GCM",
+        "compression": {"algorithm": "zstd", "level": int(zstd_level)}, "cipher": "AES-256-GCM",
         "chunk_id": "HMAC-SHA256", "kdf": "scrypt",
     }
     keys = Keys.generate(cfg["repo_id"])
@@ -92,6 +93,7 @@ class Repository:
         self.backend, self.keys, self.cfg = backend, keys, cfg
         self.params = ChunkerParams.from_dict(cfg["chunker"])
         self.pack_target = int(cfg.get("pack_target_size", packer.DEFAULT_TARGET))
+        self.keys.set_compression(int(cfg.get("compression", {}).get("level", 3)))
         self._zc = zstandard.ZstdCompressor(level=6)
         self._zd = zstandard.ZstdDecompressor()
 
@@ -507,7 +509,7 @@ class Repository:
                 for e in packer.verify_pack(self.backend.get_pack(pid), pid, self.keys, read_data):
                     index.setdefault(e.id.hex(), pid)
             except (IntegrityError, RepoError) as ex:
-                errors.append(f"pack {pid[:12]}: {ex}")
+                errors.append(str(ex) if pid[:12] in str(ex) else f"pack {pid[:12]}: {ex}")
             if progress:
                 progress(n, len(packs), f"pack {n}/{len(packs)}")
         snaps = self.backend.list_snapshots()
@@ -518,7 +520,7 @@ class Repository:
                 if lost:
                     errors.append(f"snapshot {s['id'][:12]}: thiếu {len(lost)} mẩu")
             except (IntegrityError, RepoError, ValueError) as ex:
-                errors.append(f"snapshot {s['id'][:12]}: {ex}")
+                errors.append(str(ex) if s["id"][:12] in str(ex) else f"snapshot {s['id'][:12]}: {ex}")
         return {"packs": len(packs), "chunks": len(index), "snapshots": len(snaps), "errors": errors}
 
 

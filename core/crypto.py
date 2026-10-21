@@ -56,6 +56,11 @@ class Keys:
         self._zc = zstandard.ZstdCompressor(level=zstd_level)
         self._zd = zstandard.ZstdDecompressor()
 
+    def set_compression(self, level):
+        """level 0 = khong nen; 1..22 = muc zstd (theo config cua kho)."""
+        self.compress = level > 0
+        self._zc = zstandard.ZstdCompressor(level=max(int(level), 1))
+
     @classmethod
     def generate(cls, repo_id):
         return cls(os.urandom(32), os.urandom(32), repo_id)

@@ -65,3 +65,35 @@ Windows, gồm cả file tạm tar.gz/.bkup của v1); `byte_gui` = tổng `Cont
 
 **Lưu ý khi đo để đưa vào báo cáo:** đóng bớt ứng dụng nặng, cắm sạc, không chạy việc khác cùng lúc.
 Dữ liệu vừa sinh nằm sẵn trong cache RAM của Windows (cache nóng), điều kiện này giống nhau cho v1 và v2.
+
+## 4. Quét cấu hình v2 (tuần 7) — `sweep_v2.py`
+
+```powershell
+.venv\Scripts\python.exe bench\sweep_v2.py                                   # 200MB, avg 256K..4M x zstd 0/1/3/9
+.venv\Scripts\python.exe bench\sweep_v2.py --size 500MB --avg 512,1024,2048 --levels 1,3
+```
+
+- Mỗi tổ hợp **kích thước mẩu trung bình × mức nén** dùng một kho mới và một bản sao mới của cùng bộ dữ liệu,
+  chạy full → mutate 5% → mutate 5%. Mẩu: `min = avg/2`, `max = avg×8` (tỉ lệ như mặc định 512K/1M/8M).
+  Mức nén `0` = không nén.
+- Mức nén được ghi vào `config` của kho (`compression.level`) và áp dụng mỗi khi mở kho, nên đổi cấu hình
+  không cần sửa mã nguồn: `init_repo(..., zstd_level=N)`.
+- Ghi `bench\results\v2_sweep.csv`, cột `phien_ban` dạng `v2 avg=1024K zstd=3`. Cuối cùng in bảng: thời gian full,
+  thời gian trung bình 2 lần tăng dần, byte gửi lần 2+3, dung lượng kho cuối, tỉ lệ = dữ liệu logic của 3 snapshot
+  chia dung lượng kho.
+
+## 5. So với restic — `bench_restic.py` (TÔI PHẢI TỰ CHẠY)
+
+Script **không tự tải restic**. Tự tải bản chính thức ở <https://github.com/restic/restic/releases>
+(file `restic_<phiên bản>_windows_amd64.zip`, kiểm tra với `SHA256SUMS`), giải nén rồi:
+
+```powershell
+.venv\Scripts\python.exe bench\bench_restic.py --restic D:\tools\restic.exe
+```
+
+- Cùng seed/size/kịch bản 3 lần như `bench_v2.py`; kho restic local với mặc định của restic (repo v2, nén zstd
+  `auto`, pack 16 MiB); cache restic để trong thư mục làm việc rồi xoá cùng.
+- `byte_gui` = `data_added_packed` trong summary `--json` (restic ≥ 0.17; bản cũ hơn dùng `data_added`, ghi rõ
+  trong `ghi_chu`). `byte_doc` = byte **tiến trình restic** đọc (bộ đếm IO của Windows).
+- Khôi phục snapshot cuối và so `digest`. Ghi `bench\results\restic.csv`.
+- Không tìm thấy restic → dừng với mã 3, không ghi dòng nào.
