@@ -87,8 +87,7 @@ def cmd_backup(args):
                           parent="auto" if args.parent is None else (None if args.parent == "none" else args.parent),
                           progress=None if args.quiet else _progress, canaries=args.canary or (), force=args.force)
     except AnomalyDetected as e:
-        print(f"
-DỪNG: {e}", file=sys.stderr)
+        print(f"\nDỪNG: {e}", file=sys.stderr)
         print(json.dumps(e.report, ensure_ascii=False, indent=1))
         _notify(args, {"type": "anomaly", **e.report})
         return 4
