@@ -1,6 +1,11 @@
 """
 Dien tap su co cho loi v2 - ghi so do vao bench/results/dien_tap.csv (cot nhu bench/common.py).
 
+  k1  RANSOMWARE (tuan 8): sao luu tot -> gia lap ma hoa 70% file van ban + sua file moi -> lan sao luu ke tiep phai bi
+      CONG CHAN dung (khong gui gi len kho, khong co snapshot moi) -> khoi phuc tu ban tot cuoi, digest khop du lieu goc.
+  k2  DUNG LAI MAY KHAC (tuan 8): may cu co SQLBackup (.bak/.trn) + ChiaSe + Web; chi khoi phuc 2 nhanh SQLBackup va
+      ChiaSe ra "may moi" (tai dung phan can bang Range), in lenh RESTORE ... STOPAT va New-SmbShare (chay that khi
+      --sql-dir + --sql-instance / --share). IIS de sau, dung ke hoach.
   k5  XOA / GHI DE backup phai bi tu choi: dung CHINH chung chi client (nhu ransomware tren may agent)
       gui DELETE / PUT ghi de / POST / PATCH / MOVE toi API kho; sau do tai lai, so SHA-256 -> nguyen ven.
       Kho that: chi tan cong pack + snapshot cua mot bo du lieu tham do vua sao luu (tag dien-tap-k5),
@@ -30,12 +35,14 @@ k8 chi chay tren kho local tam trong bench/work (khong bao gio sua kho that).
 import argparse
 import hashlib
 import os
+import random
 import shutil
+import subprocess
 import sys
 import threading
 import time
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -92,6 +99,19 @@ class LocalStub:
 
     def close(self):
         self.srv.shutdown()
+
+
+class LocalKho(LocalStub):
+    """API kho THAT (kho/app.py, tuan 2-3 cua Nguoi B) chay tam tren 127.0.0.1 - dung cho K1/K2 (va K5 khi khong --repo)."""
+
+    def __init__(self, root):
+        from werkzeug.serving import make_server
+        from kho.app import create_app
+        self.app = create_app(root)
+        self.state = self.app.config["kho_state"]
+        self.srv = make_server("127.0.0.1", 0, self.app, threaded=True)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.srv.port}"
 
 
 def _row(kb, lan, mo_ta, secs, note, **kw):
@@ -432,11 +452,181 @@ def k8(args, work):
     return rows
 
 
+# ===================================================================== K1 (tuan 8): ransomware -> cong chan -> khoi phuc
+RANSOM_TARGETS = (".txt", ".md", ".csv", ".json", ".ini", ".xml", ".docx", ".xlsx")
+
+
+def _ransomware(root, rng, ratio=0.7):
+    """Gia lap ransomware: ghi noi dung ngau nhien (entropy cao) + doi ten .locked cho `ratio` file van ban / van phong,
+    sua file moi (canary), de lai thu doi tien chuoc. Tra ve so file bi ma hoa."""
+    files = [p for _, p in make_dataset.iter_files(root)
+             if p.suffix.lower() in RANSOM_TARGETS and "canary" not in p.name.lower()]
+    hit = rng.sample(files, max(1, int(len(files) * ratio)))
+    for p in hit:
+        p.write_bytes(os.urandom(max(p.stat().st_size, 64)))
+        p.rename(p.with_name(p.name + ".locked"))
+    for c in root.rglob("~bks_canary*"):
+        c.write_bytes(b"DA BI MA HOA " + os.urandom(32))
+    (root / "HUONG_DAN_CHUOC.txt").write_bytes(b"Your files are encrypted. Pay 2 BTC to ...")
+    return len(hit)
+
+
+def _open_kho(args, work, stubs, note0):
+    """(backend, repo, ghi chu): kho that qua --repo, hoac API kho THAT (kho/app.py) chay tam tren 127.0.0.1."""
+    if args.repo:
+        backend = _http(args, args.repo)
+        return backend, Repository.open(backend, _password(args)), note0 + " kho=that"
+    k = LocalKho(work / "kho")
+    stubs.append(k)
+    backend = _http(args, k.url)
+    repo = init_repo(backend, PASSWORD, pack_target=args.pack_mb * 1024 * 1024, scrypt=FAST_SCRYPT)
+    return backend, repo, note0 + " kho=api-127.0.0.1"
+
+
+def k1(args, work):
+    """K1: ransomware ma hoa du lieu -> lan sao luu ke tiep bi CONG CHAN dung (khong gui gi len kho)
+    -> khoi phuc tu snapshot tot cuoi cung, so digest voi du lieu goc."""
+    from core.anomaly import AnomalyDetected
+    data, ds, seed = _dataset(args, work)
+    (data / "~bks_canary_dung_sua.txt").write_bytes("File mồi - không ai được sửa".encode("utf-8"))
+    digest0 = make_dataset.dataset_digest(data)
+    note0 = f"seed={seed} size={args.size} {power_note()}".strip()
+    stubs, rows = [], []
+    try:
+        backend, repo, note = _open_kho(args, work, stubs, note0)
+        pw = _password(args) if args.repo else PASSWORD
+        t0 = time.perf_counter()
+        res = repo.backup([str(data)], tags=["dien-tap-k1"])
+        sid = res["snapshot_id"]
+        rows.append(_row("K1", 1, "sao lưu bình thường", time.perf_counter() - t0,
+                         f"{note} snapshot={sid[:12]} chunks={res['stats']['chunks']}",
+                         byte_gui=res["stats"]["bytes_uploaded"], so_file=ds["so_file"], kich_thuoc_du_lieu=ds["tong_byte"]))
+        snaps_before, packs_before = len(backend.list_snapshots()), None
+        n_enc = _ransomware(data, random.Random(seed))
+        t0 = time.perf_counter()
+        try:
+            Repository.open(backend, pw).backup([str(data)], tags=["dien-tap-k1"])
+            blocked, reasons = False, "KHONG CHAN - ban bi ma hoa da len kho"
+        except AnomalyDetected as e:
+            blocked, reasons = True, "; ".join(e.report["reasons"])
+        snaps_after = len(backend.list_snapshots())
+        rows.append(_row("K1", 2, "ransomware rồi sao lưu: cổng chặn", time.perf_counter() - t0,
+                         f"{note} ma_hoa={n_enc} cong_chan={'CHAN' if blocked else 'LOT'} "
+                         f"snapshot_moi={snaps_after - snaps_before} ly_do='{reasons[:150]}'"))
+        out = work / "khoi_phuc"
+        t0 = time.perf_counter()
+        st = Repository.open(backend, pw).restore(sid, out)
+        ok = make_dataset.dataset_digest(out / data.name) == digest0
+        rows.append(_row("K1", 3, "khôi phục từ bản tốt cuối", time.perf_counter() - t0,
+                         f"{note} snapshot={sid[:12]} files={st['files']} tai={fmt_bytes(st['bytes_downloaded'])} "
+                         f"khop_sha256={st.get('verified', 0)}/{st['files']} digest={'khop' if ok else 'KHAC'}",
+                         byte_doc=st["bytes_downloaded"], so_file=st["files"]))
+    finally:
+        for s in stubs:
+            s.close()
+        if rows:
+            append_rows(args.csv, rows)
+    return rows
+
+
+# ===================================================================== K2 (tuan 8): dung lai CHI CSDL + chia se tren may khac
+def _fake_sql_backups(d, rng):
+    """File .bak/.trn gia, ten theo quy uoc scripts/sql (FULL 5 ngay truoc, DIFF 1 ngay, LOG moi 15 phut gan day)."""
+    d.mkdir(parents=True, exist_ok=True)
+    now = datetime.now()
+    plan = [("FULL", now - timedelta(days=5), "bak", 1_500_000), ("DIFF", now - timedelta(days=1), "bak", 600_000),
+            ("LOG", now - timedelta(minutes=45), "trn", 150_000), ("LOG", now - timedelta(minutes=30), "trn", 150_000),
+            ("LOG", now - timedelta(minutes=15), "trn", 150_000)]
+    for kind, t, ext, size in plan:
+        (d / f"ShopDB_{kind}_{t:%Y%m%d_%H%M%S}.{ext}").write_bytes(rng.randbytes(size))
+
+
+def _hashes(root):
+    return {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in Path(root).rglob("*") if p.is_file()}
+
+
+def k2(args, work):
+    """K2: may chu hong -> dung lai CHI CSDL (file .bak/.trn) + thu muc chia se tren MAY KHAC, chua dung IIS:
+    chi tai dung 2 nhanh can tu snapshot (Range), in (hoac chay) lenh RESTORE SQL va New-SmbShare."""
+    seed = args.seed if args.seed is not None else (int(time.time()) if args.repo else make_dataset.SEED_DEFAULT)
+    rng = random.Random(seed)
+    may_cu = work / "may_cu"
+    share, sqlb, web = may_cu / "ChiaSe", may_cu / "SQLBackup", may_cu / "Web"
+    ds = make_dataset.generate(share, args.size, seed)
+    if args.sql_dir:
+        shutil.copytree(args.sql_dir, sqlb / Path(args.sql_dir).name)
+    else:
+        _fake_sql_backups(sqlb / "ShopDB", rng)
+    web.mkdir(parents=True)
+    (web / "index.html").write_bytes(b"<h1>IIS - dung lai o buoc sau</h1>\n" * 2000)
+    (web / "web.config").write_bytes(b"<configuration/>")
+    print(f"[dien tap] may cu: ChiaSe {ds['so_file']} file, SQLBackup {len(list(sqlb.rglob('*.*')))} file, Web (bo qua khi dung lai)", flush=True)
+    note0 = f"seed={seed} size={args.size} {power_note()}".strip()
+    stubs, rows = [], []
+    try:
+        backend, repo, note = _open_kho(args, work, stubs, note0)
+        pw = _password(args) if args.repo else PASSWORD
+        t0 = time.perf_counter()
+        res = repo.backup([str(sqlb), str(share), str(web)], tags=["dien-tap-k2"])
+        sid, total_up = res["snapshot_id"], res["stats"]["bytes_uploaded"]
+        rows.append(_row("K2", 1, "sao lưu máy cũ: SQLBackup + ChiaSe + Web", time.perf_counter() - t0,
+                         f"{note} snapshot={sid[:12]} files={res['stats']['files']}", byte_gui=total_up,
+                         so_file=res["stats"]["files"], kich_thuoc_du_lieu=res["stats"]["bytes"]))
+        may_moi = work / "may_moi"
+        r = Repository.open(backend, pw)
+        got = 0
+        for lan, inc in ((2, "SQLBackup"), (3, "ChiaSe")):
+            t0 = time.perf_counter()
+            st = r.restore(sid, may_moi, include=inc)
+            got += st["bytes_downloaded"]
+            rows.append(_row("K2", lan, f"máy mới: chỉ khôi phục {inc}", time.perf_counter() - t0,
+                             f"{note} files={st['files']} tai={fmt_bytes(st['bytes_downloaded'])} "
+                             f"khop_sha256={st.get('verified', 0)}/{st['files']}", byte_doc=st["bytes_downloaded"], so_file=st["files"]))
+        ok_share = make_dataset.dataset_digest(may_moi / "ChiaSe") == make_dataset.dataset_digest(share)
+        ok_sql = _hashes(may_moi / "SQLBackup") == _hashes(sqlb)
+        web_restored = (may_moi / "Web").exists()
+
+        sql_new = may_moi / "SQLBackup" / (Path(args.sql_dir).name if args.sql_dir else "ShopDB")
+        db = sql_new.name
+        stop_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        inst = args.sql_instance or r"<may-moi>\SQLEXPRESS"
+        cmd_sql = (f'powershell -ExecutionPolicy Bypass -File scripts\\sql\\restore_pitr.ps1 -Database {db} '
+                   f'-BackupDir "{sql_new.parent}" -Instance "{inst}" -StopAt "{stop_at}" -TargetDatabase {db}_k2')
+        cmd_share = f'New-SmbShare -Name ChiaSe -Path "{may_moi / "ChiaSe"}" -ChangeAccess "Users"'
+        sql_result = "chua chay (can --sql-dir <thu muc .bak that> va --sql-instance)"
+        if args.sql_instance and args.sql_dir:
+            t0 = time.perf_counter()
+            p = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
+                                str(REPO / "scripts" / "sql" / "restore_pitr.ps1"), "-Database", db, "-BackupDir", str(sql_new.parent),
+                                "-Instance", args.sql_instance, "-StopAt", stop_at, "-TargetDatabase", f"{db}_k2", "-Replace"],
+                               capture_output=True, text=True, timeout=900, encoding="utf-8", errors="replace")
+            print(p.stdout[-1500:], flush=True)
+            sql_result = f"restore_pitr ma {p.returncode} ({time.perf_counter() - t0:.1f}s) -> CSDL {db}_k2"
+        share_result = "chua chay (them --share, can Administrator)"
+        if args.share:
+            p = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmd_share],
+                               capture_output=True, text=True, timeout=120, encoding="utf-8", errors="replace")
+            share_result = f"New-SmbShare ma {p.returncode}"
+        rows.append(_row("K2", 4, "máy mới: dựng lại CSDL + chia sẻ, bỏ qua Web", 0.0,
+                         f"{note} tai_mot_phan={fmt_bytes(got)}/{fmt_bytes(total_up)} web_bo_qua={'co' if not web_restored else 'KHONG'} "
+                         f"chia_se={'khop' if ok_share else 'KHAC'} sql_file={'khop' if ok_sql else 'KHAC'} sql='{sql_result}' share='{share_result}'"))
+        print("\nLenh dung lai tren may moi:\n  " + cmd_sql + "\n  " + cmd_share, flush=True)
+    finally:
+        for s in stubs:
+            s.close()
+        if rows:
+            append_rows(args.csv, rows)
+    return rows
+
+
 def main(argv=None):
     setup_console()
-    ap = argparse.ArgumentParser(description="Dien tap su co K6/K7/K8 cho loi v2.")
-    ap.add_argument("kich_ban", choices=["k5", "k6", "k7", "k8"])
-    ap.add_argument("--size", default=None, help="k5: 5MB, k6: 100MB, k7: 40MB, k8: 30MB")
+    ap = argparse.ArgumentParser(description="Dien tap su co K1/K2 (tuan 8), K5/K6/K7/K8 (tuan 7) cho loi v2.")
+    ap.add_argument("kich_ban", choices=["k1", "k2", "k5", "k6", "k7", "k8"])
+    ap.add_argument("--size", default=None, help="k1: 20MB, k2: 20MB, k5: 5MB, k6: 100MB, k7: 40MB, k8: 30MB")
+    ap.add_argument("--sql-dir", help="k2: thu muc .bak/.trn THAT (vd D:\\SQLBackup\\ShopDB) thay cho file gia")
+    ap.add_argument("--sql-instance", help="k2: chay restore_pitr.ps1 that len instance nay (vd (localdb)\\MSSQLLocalDB)")
+    ap.add_argument("--share", action="store_true", help="k2: tao SMB share that (can Administrator)")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--limit", default="4MB/s", help="k7: muc gioi han")
     ap.add_argument("--pack-mb", type=int, default=4, help="kich thuoc pack muc tieu (MiB) cho kho moi")
@@ -453,12 +643,12 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if args.kich_ban == "k8" and args.repo:
         ap.error("k8 chi chay tren kho local tam, khong sua kho that")
-    args.size = args.size or {"k5": "5MB", "k6": "100MB", "k7": "40MB", "k8": "30MB"}[args.kich_ban]
+    args.size = args.size or {"k1": "20MB", "k2": "20MB", "k5": "5MB", "k6": "100MB", "k7": "40MB", "k8": "30MB"}[args.kich_ban]
 
     work = Path(args.workdir).resolve() / f"{args.kich_ban}-{datetime.now():%Y%m%d-%H%M%S}"
     work.mkdir(parents=True)
     try:
-        rows = {"k5": k5, "k6": k6, "k7": k7, "k8": k8}[args.kich_ban](args, work)
+        rows = {"k1": k1, "k2": k2, "k5": k5, "k6": k6, "k7": k7, "k8": k8}[args.kich_ban](args, work)
     finally:
         if not args.keep:
             shutil.rmtree(work, ignore_errors=True)

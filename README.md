@@ -119,6 +119,32 @@ hoặc `--limit-schedule config\gioi_han_toc_do.json`. Đứt mạng giữa ch�
 các mẩu còn thiếu. Checklist chạy thật: [`docs/tuan3-chay-that.md`](docs/tuan3-chay-that.md).
 SQL Server: [`scripts/sql/`](scripts/sql/) (Full hàng tuần / Diff hàng ngày / Log 15 phút, CHECKSUM, 3 Scheduled Task).
 
+## Phần Người B (tuần 2–6): kho API thật, mTLS, cloud Object Lock, Telegram
+
+| Tuần | Gì | Ở đâu |
+|---|---|---|
+| 2–3 | **API kho** chỉ thêm (không có lệnh xoá, PUT trùng bỏ qua, Range cho khôi phục 1 file, `/health` `/stats`) | `kho/` → `python -m kho --kho D:\kho-v2` hoặc `kho\start_kho.bat` |
+| 3 | Caddy **mTLS** (allow-list chứng chỉ client), cấp/thu hồi chứng chỉ bằng openssl, cài kho thành dịch vụ chạy bằng `LOCAL SERVICE` bị **NTFS deny Delete**, tường lửa chỉ mở cổng kho trên Tailscale | `deploy/kho/` — hướng dẫn `docs/tuan3-kho-mtls.md` |
+| 4 | Web **Tổng quan v2**: RPO xanh/vàng/đỏ, máy được bảo vệ, snapshot, tỉ lệ khử trùng lặp, tình trạng kho | `server/monitor.py`, `server/static/js/views_v2.js` (server đọc kho qua `BACKUP_KHO_URL`, mặc định `http://127.0.0.1:8080`) |
+| 5 | rclone đẩy kho lên bucket **Object Lock** 30 ngày mỗi ngày; bài thử xoá phải bị từ chối | `deploy/cloud/` — `docs/tuan5-cloud-object-lock.md` |
+| 6 | **Thông báo**: sự kiện trên web + bot **Telegram** với nút Bình thường / Sự cố; webhook `/api/notify` cho `core verify/backup --notify-url` và script SQL/cloud; RPO đổi màu tự báo; job **Khôi phục thử** và **Kiểm tra kho** tạo từ web hoặc lịch hằng tuần | `server/notify.py`, Cài đặt → Telegram |
+
+Tiến độ từng tuần đối chiếu kế hoạch và phiếu theo dõi: [`docs/tien-do-theo-tuan.md`](docs/tien-do-theo-tuan.md).
+
+## Demo tuần 8 trên một máy
+
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy\demo\chuan_bi_demo.ps1     # .venv, D:\DemoBackup (kho, dữ liệu mẫu, tài khoản admin/demo12345)
+deploy\demo\demo_1_may.bat                                                  # mở KHO + SERVER + AGENT + trình duyệt
+```
+
+Kịch bản 12 phút (sao lưu, khử trùng lặp, K3 xoá nhầm, K5 xoá backup bị từ chối, K1 ransomware bị cổng chặn,
+khôi phục thử, Telegram, K2): [`docs/demo-tuan-8.md`](docs/demo-tuan-8.md). Diễn tập tự động:
+`python bench\dien_tap.py k1|k2|k5 [--repo http://127.0.0.1:8080 --password-file ...]`.
+
+Bộ cài: `install.bat` (Python), `deploy\kho\cai_dat_kho.ps1` (kho + NTFS + dịch vụ), `deploy\agent\cai_dat_agent.ps1`
+(agent chạy khi đăng nhập, quyền cao nhất).
+
 ## Kiểm thử và đo đạc
 
 ```bat
@@ -139,24 +165,29 @@ Thử khôi phục cấu hình mạng: thư mục [`test-scripts/`](test-scripts
 
 ```
 backup-system/
-├── server/            server.py (app + API), scheduler.py, static/ (CSS/JS giao diện), templates/app.html
-├── agent/             agent.py (vòng poll), backup_logic.py, restore_logic.py, system_state.py,
-│                      network_advanced.py, sql_registry.py, folder_browser.py, remote_storage.py, winexec.py
+├── server/            server.py (app + API), scheduler.py, monitor.py (RPO/dedup/kho), notify.py (Telegram),
+│                      static/ (CSS/JS giao diện; views_v2.js = Tổng quan, Thông báo), templates/app.html
+├── kho/               API kho v2 chỉ thêm (python -m kho) - Người B
+├── agent/             agent.py (vòng poll), v2_engine.py, backup_logic.py, restore_logic.py, system_state.py,
+│                      netplan.py, network_advanced.py, sql_registry.py, folder_browser.py, winexec.py
 ├── shared/            config.py, database.py, encryption_utils.py, snapshot.py, log.py, text.py
-├── core/              v2: scanner, chunker, crypto, packer, repo_local, repository, cli (python -m core)
-├── bench/             make_dataset.py, bench_v1/v2.py, sweep_v2.py, bench_restic.py, dien_tap.py, results/*.csv
-├── tests/             pytest
-├── docs/              repo-format.md (hợp đồng kho v2), vss-test.md, PRODUCT.md, lich-su/
-├── scripts/           vss_test.ps1
+├── core/              v2: scanner, chunker, crypto, packer, repo_local, repo_http, repository, prune, anomaly, cli
+├── deploy/            kho/ (Caddyfile, make_certs, cai_dat_kho, tuong_lua), cloud/ (rclone Object Lock),
+│                      agent/ (cai_dat_agent), demo/ (chuan_bi_demo, demo_1_may.bat, gia_ransomware)
+├── bench/             make_dataset.py, bench_v1/v2.py, sweep_v2.py, bench_restic.py, dien_tap.py (k1 k2 k5-k8), results/*.csv
+├── tests/             pytest (163+ test)
+├── docs/              repo-format.md, tien-do-theo-tuan.md, demo-tuan-8.md, tuan3-kho-mtls.md, tuan5-cloud-object-lock.md, ...
+├── scripts/           sql/ (backup Full/Diff/Log, PITR, verify), vss_test.ps1
 ├── test-scripts/      .bat đổi/kiểm tra cấu hình mạng để thử khôi phục
 ├── install.bat, download_wheels.bat, requirements.txt
 ```
 
 ## Hạn chế và hướng phát triển
 
-- Bản 1.5 mỗi lần vẫn là bản đầy đủ → lõi v2 (`core/`) đã chạy local; tuần 3 nối qua mạng (API kho của B + mTLS)
-  và thay thế đường backup của agent.
-- Kho nằm trên chính PC → tuần 5: bản sao bất biến (Object Lock) lên cloud.
-- Server dùng HTTP trong Tailscale (đã mã hoá bởi WireGuard) → tuần 3: Caddy mTLS.
+- Agent với `ENGINE=v2` đã sao lưu qua API kho thật (`kho/`); phần chạy thật laptop → PC qua Tailscale + Caddy mTLS
+  cần Tailscale và `caddy.exe` trên PC (checklist `docs/tuan3-chay-that.md`, `docs/tuan3-kho-mtls.md`).
+- Bản sao cloud Object Lock: script sẵn (`deploy/cloud/`), cần tài khoản B2/AWS (hoặc MinIO cục bộ) để chạy thật.
+- Telegram cần token bot; không có thì mục Thông báo trên web vẫn đủ.
+- Chưa làm: so với restic bằng `restic.exe` thật, E6 (iperf3/nmap/Wireshark), K4 dựng lại từ cloud, runbook và slide (tuần 9–10).
 
 *Đồ án phục vụ mục đích học tập.*
