@@ -67,3 +67,7 @@ instance/
 bench/data/
 bench/work/
 .pytest_cache/
+
+# ===== Tuan 3 (B): chung chi mTLS + log Caddy (sinh boi deploy/kho/make_certs.ps1) =====
+deploy/kho/certs/
+deploy/kho/logs/

@@ -1,0 +1,4 @@
+# Danh sach may duoc phep goi API kho (allow-list cua Caddy). FILE NAY DO make_certs.ps1 SINH LAI.
+# Moi may mot dong:  trusted_leaf_cert_file certs/clients/<ten>.crt
+# Thu hoi = chay make_certs.ps1 -Revoke <ten> (dong bi xoa, file chung chi chuyen vao certs\revoked\) roi khoi dong lai Caddy.
+# Chua co may nao -> chi can chung chi do CA noi bo ky (certs/ca.crt) la vao duoc.

@@ -1,6 +1,6 @@
 # Định dạng kho v2 (repo-format) — hợp đồng giữa Người A và Người B
 
-> Phiên bản định dạng: **1** · Trạng thái: **BẢN NHÁP chờ B chốt** · Cập nhật: 2026-10-14
+> Phiên bản định dạng: **1** · Trạng thái: **ĐÃ CHỐT** (B đã hiện thực API kho trong `kho/`, xem §14 và `docs/tuan3-kho-mtls.md`) · Cập nhật: 2026-11-14
 >
 > Người A (lõi dữ liệu) viết client: cắt mẩu, mã hoá, gom pack, snapshot (`core/`).
 > Người B (mạng/vận hành) viết **API kho** chạy trên PC, đứng sau Caddy mTLS.
@@ -346,6 +346,16 @@ snapshot, không biết mẩu nằm ở pack nào, máy mới không lấy đư�
   **không** thử lại với 4xx khác.
 - Timeout gợi ý: kết nối 10 s, đọc/ghi 120 s cho mỗi pack.
 
+### 10.4 Lệnh đọc trạng thái kho (B, tuần 4) — chỉ đọc, không đổi định dạng
+
+| Lệnh | Response | Dùng cho |
+|---|---|---|
+| `GET /health` | `{"ok":true,"version":"1.0","packs":n,"snapshots":m,"initialized":true,"time":"…"}` | kiểm tra kho sống (cài dịch vụ, demo) |
+| `GET /stats` | như `/health` + `bytes_packs`, `bytes_snapshots`, `bytes_on_disk`, `disk:{total,free}`, `requests`, `packs_created`, `snapshots_created`, `bytes_in`, `rejected` (số lệnh xoá/ghi đè/quá lớn bị từ chối), `started`, `last_write` | trang tổng quan: dung lượng kho, tỉ lệ khử trùng lặp, "kho có kết nối không" |
+
+Hiện thực: `kho/app.py`. Mọi method khác trên mọi đường dẫn → `405 method_not_allowed`; đường dẫn lạ → `404 not_found`.
+Thân lỗi là `{"error": "<mã>", "message": "<mô tả>"}` (client `core/repo_http.py` đọc `message`).
+
 ## 11. Thứ tự ghi và chạy lại sau sự cố
 
 ```
@@ -391,11 +401,11 @@ bao giờ trả dữ liệu sai.
 
 Ví dụ thật (kho tạo bằng `python -m core init`): `config`, `keys\<64 hex>`, `packs\3f\3f9a…`, `snapshots\<64 hex>`.
 
-## 14. Việc B cần xác nhận
+## 14. Việc B cần xác nhận — đã chốt (tuần 3, `kho/app.py` + `deploy/kho/`)
 
-- [ ] Đường dẫn + mã lỗi của 4 lệnh chính (§10.1)
-- [ ] Các lệnh đọc bổ sung (§10.2) — nếu không đồng ý thì restore qua mạng phải làm cách khác
-- [ ] Giới hạn: 10 000 ID/lần, pack ≤ 64 MiB, snapshot ≤ 256 MiB
-- [ ] Ghi tạm → đổi tên trên cùng ổ, index cập nhật sau đổi tên, tự quét bổ sung khi khởi động
-- [ ] Header `X-Client-Subject` từ Caddy (tuỳ chọn)
-- [ ] Cách dọn bản hết hạn (§13)
+- [x] Đường dẫn + mã lỗi của 4 lệnh chính (§10.1) — đúng hợp đồng; test `tests/test_kho_api.py`
+- [x] Các lệnh đọc bổ sung (§10.2) — làm đủ, restore/init qua mạng chạy được
+- [x] Giới hạn: 10 000 ID/lần, pack ≤ 64 MiB, snapshot ≤ 256 MiB (config/key ≤ 1 MiB)
+- [x] Ghi tạm → đổi tên trên cùng ổ, index cập nhật sau đổi tên, quét lại footer + bảng ID mọi pack khi khởi động (`LocalRepo`)
+- [x] Header `X-Client-Subject` từ Caddy → kho ghi log từng lệnh kèm subject chứng chỉ
+- [x] Dọn bản hết hạn (§13): `python -m core prune --apply` chạy cục bộ trên PC bằng tài khoản quản trị sau khi dừng dịch vụ kho; API không có lệnh xoá; tài khoản chạy kho bị NTFS deny Delete (`cai_dat_kho.ps1`)

@@ -1,0 +1,47 @@
+# Caddy dung TRUOC API kho (Nguoi B, tuan 3): ket thuc TLS + BAT BUOC chung chi client (mTLS).
+#
+#   caddy run --config Caddyfile            (chay tu thu muc deploy\kho - duong dan certs\ la tuong doi)
+#   caddy validate --config Caddyfile       (kiem tra cu phap)
+#   caddy reload --config Caddyfile         (sau khi them/thu hoi may - can bat admin API, xem ghi chu duoi)
+#
+# Chung chi tao bang make_certs.ps1 (-InitCA, -Server, -Client <ten>). Thu hoi mot may: make_certs.ps1 -Revoke <ten>
+# roi khoi dong lai Caddy (hoac `caddy reload` neu bo dong `admin off`).
+# App kho (python -m kho) chi nghe 127.0.0.1:8080; tu ngoai chi vao duoc qua cong 8443 nay, va chi khi
+# co chung chi client nam trong danh sach cho phep (clients.caddy).
+
+{
+	auto_https off
+	admin off
+}
+
+:8443 {
+	tls certs/server.crt certs/server.key {
+		client_auth {
+			mode require_and_verify
+			trusted_ca_cert_file certs/ca.crt
+			# Danh sach may DUOC PHEP (allow-list): moi dong "trusted_leaf_cert_file certs/clients/<ten>.crt".
+			# make_certs.ps1 sinh lai file nay; xoa dong = thu hoi.
+			import clients.caddy
+		}
+	}
+
+	# pack toi da 64 MiB, snapshot toi da 256 MiB (docs/repo-format.md muc 10)
+	request_body {
+		max_size 256MB
+	}
+
+	reverse_proxy 127.0.0.1:8080 {
+		# Kho ghi log ai goi (subject chung chi client), xem kho\logs\kho.log
+		header_up X-Client-Subject {http.request.tls.client.subject}
+		transport http {
+			response_header_timeout 300s
+		}
+	}
+
+	log {
+		output file logs/caddy-access.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+	}
+}
