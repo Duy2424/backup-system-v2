@@ -13,6 +13,7 @@ param(
     [string]$BackupDir = 'D:\SQLBackup',
     [string]$Instance = 'localhost\SQLEXPRESS',
     [string]$Report = '',
+    [string]$NotifyUrl = '',
     [switch]$PrintOnly
 )
 $ErrorActionPreference = 'Stop'
@@ -47,4 +48,9 @@ $rep = [ordered]@{ type = 'verify_sql'; result = $(if ($ok) { 'OK' } else { 'LOI
 $json = $rep | ConvertTo-Json
 if ($Report) { Set-Content -LiteralPath $Report -Value $json -Encoding UTF8 }
 Write-Host $json
+# tuan 6: bao ket qua len web (Thong bao + Telegram): -NotifyUrl "http://127.0.0.1:5000/api/notify?token=<AGENT_TOKEN>"
+if ($NotifyUrl) {
+    try { Invoke-RestMethod -Method Post -Uri $NotifyUrl -Body ([Text.Encoding]::UTF8.GetBytes($json)) -ContentType 'application/json; charset=utf-8' -TimeoutSec 15 | Out-Null }
+    catch { Write-Host "Khong gui duoc thong bao toi $NotifyUrl : $_" }
+}
 if ($ok) { exit 0 } else { exit 1 }

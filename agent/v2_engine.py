@@ -80,8 +80,17 @@ class V2Engine:
             "engine": "v2", "filename": PREFIX + res["snapshot_id"], "snapshot_id": res["snapshot_id"],
             "size": s["bytes_uploaded"], "components": comps, "paths": [p for p in sources if p != self._state_dir()],
             "snapshot_summary": {"total_files": s["files"], "total_size": s["bytes"], "components": comps},
-            "stats": {**s, "skipped": len(res["errors"])},
+            "stats": {**s, "skipped": len(res["errors"]),
+                      "anomaly_alarm": bool((res.get("anomaly") or {}).get("alarm"))},
         }
+
+    def verify(self, sample=20):
+        """Tuan 6: khoi phuc thu vai file ngau nhien cua snapshot moi nhat, so SHA-256 (tra ve bao cao)."""
+        return self.repo().verify_restore(sample=sample, workdir=self.cfg.WORK_DIR)
+
+    def check(self, full=False, progress=None):
+        """Kiem tra toan ven kho: nhanh (SHA-256 + cau truc) hoac day du (giai ma tung mau)."""
+        return self.repo().check(read_data=full, progress=progress)
 
     def restore(self, name, params, progress_cb=None):
         from agent import system_state

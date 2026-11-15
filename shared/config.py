@@ -83,6 +83,22 @@ V2_KEY = _agent_cfg.get("V2_KEY", "")
 V2_CA = _agent_cfg.get("V2_CA", "")
 V2_LIMIT_SCHEDULE = _agent_cfg.get("V2_LIMIT_SCHEDULE", "")
 
+# ===== KHO v2 - server doc trang thai kho de hien trang tong quan (tuan 4, B) =====
+# KHO_URL: API kho (mac dinh kho chay cung PC voi server: http://127.0.0.1:8080). Qua Caddy mTLS thi them cert/key/ca.
+# KHO_DIR: neu dat, server doc thang thu muc kho (khong goi HTTP).
+KHO_URL = _env("BACKUP_KHO_URL", "http://127.0.0.1:8080")
+KHO_DIR = _env("BACKUP_KHO_DIR", "")
+KHO_CERT = _env("BACKUP_KHO_CERT", "")
+KHO_KEY = _env("BACKUP_KHO_KEY", "")
+KHO_CA = _env("BACKUP_KHO_CA", "")
+
+# ===== RPO (tuan 4): bao lau chua co ban sao luu thanh cong thi den vang / do (gio) =====
+RPO_HOURS = float(_env("BACKUP_RPO_HOURS", "24"))
+
+# ===== THONG BAO TELEGRAM (tuan 6, B) - co the nhap trong web (Cai dat), uu tien hon bien moi truong =====
+TELEGRAM_TOKEN = _env("BACKUP_TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = _env("BACKUP_TELEGRAM_CHAT_ID", "")
+
 # ===== THANH PHAN BACKUP =====
 # Tick muc nao thi chi backup/restore muc do; tick het = backup toan bo.
 BACKUP_COMPONENTS = [

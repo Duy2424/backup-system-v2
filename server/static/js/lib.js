@@ -153,7 +153,7 @@ export const JOB_STATUS = {
   failed: { label: "Thất bại", cls: "err", icon: "err" },
   cancelled: { label: "Đã huỷ", cls: "", icon: "stop" },
 };
-export const JOB_TYPE = { backup: "Sao lưu", restore: "Khôi phục" };
+export const JOB_TYPE = { backup: "Sao lưu", restore: "Khôi phục", verify: "Khôi phục thử", check: "Kiểm tra kho" };
 
 export function statusPill(status) {
   const s = JOB_STATUS[status] || { label: status, cls: "", icon: "info" };
@@ -164,6 +164,8 @@ export function statusPill(status) {
 
 export function jobTitle(j) {
   if (j.type === "restore") return j.params && j.params.dry_run ? "Chạy thử khôi phục" : "Khôi phục";
+  if (j.type === "verify") return j.params && j.params.schedule_id ? "Khôi phục thử theo lịch" : "Khôi phục thử";
+  if (j.type === "check") return "Kiểm tra kho";
   return j.params && j.params.schedule_id ? "Sao lưu theo lịch" : "Sao lưu";
 }
 
@@ -254,4 +256,29 @@ export function emptyState(iconName, title, text, action) {
 export function skeletonRows(n = 3) {
   return h("div", { class: "panel-body" }, Array.from({ length: n }, (_, i) =>
     h("span", { class: "skel", style: { width: `${90 - i * 12}%` } })));
+}
+
+// ------------------------------------------------------------------ v2: RPO, su kien (tuan 4-6)
+// RPO = tuoi cua ban sao luu thanh cong gan nhat so voi muc tieu (mac dinh 24 gio). Luon kem chu, khong chi mau.
+export const RPO = {
+  xanh: { label: "Đạt mục tiêu" },
+  vang: { label: "Sắp quá hạn" },
+  do: { label: "Quá hạn" },
+};
+export function rpoPill(status, { large = false } = {}) {
+  const key = RPO[status] ? status : "do";
+  return h("span", { class: `rpo ${key}${large ? " lg" : ""}`, role: "status" }, RPO[key].label);
+}
+export const EVENT_LEVEL = { ok: "Thành công", info: "Thông tin", warn: "Cảnh báo", err: "Lỗi" };
+export const EVENT_KIND = {
+  backup: "Sao lưu", restore: "Khôi phục", anomaly: "Bất thường", verify: "Khôi phục thử", rpo: "RPO", kho: "Kho",
+  test: "Tin thử", telegram: "Telegram", prune: "Dọn kho", verify_sql: "CSDL",
+};
+export const ACK = { binh_thuong: "Bình thường", su_co: "Sự cố" };
+export const fmtRatio = (r) => (r == null ? "–" : `${nf1.format(r)}×`);
+export function fmtHours(hours) {
+  if (hours == null) return "–";
+  if (hours < 1) return `${Math.round(hours * 60)} phút`;
+  if (hours < 48) return `${nf1.format(hours)} giờ`;
+  return `${nf1.format(hours / 24)} ngày`;
 }

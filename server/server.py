@@ -33,7 +33,7 @@ from flask import Flask, g, jsonify, render_template, request, send_file, sessio
 
 from shared import config, database  # noqa: E402
 from shared.log import setup_logging  # noqa: E402
-from server import scheduler  # noqa: E402
+from server import monitor, notify, scheduler  # noqa: E402
 
 log = logging.getLogger("server")
 
@@ -116,8 +116,9 @@ def schedule_out(s):
     return {"id": s["id"], "name": s["name"], "schedule_type": s["schedule_type"],
             "interval_hours": s.get("interval_hours"), "time_of_day": s.get("time_of_day"),
             "day_of_week": s.get("day_of_week"), "enabled": bool(s.get("enabled")),
-            "paths": p["paths"] or [], "components": p["components"] or list(config.BACKUP_COMPONENTS),
-            "last_run": ts(s.get("last_run")), "next_run": ts(s.get("next_run"))}
+            "paths": p.get("paths") or [], "components": p.get("components") or list(config.BACKUP_COMPONENTS),
+            "last_run": ts(s.get("last_run")), "next_run": ts(s.get("next_run")),
+            "job_type": s.get("job_type") or "backup"}
 
 
 def agent_out(a):
@@ -137,6 +138,12 @@ def user_out(u, with_token=False):
     if with_token:
         out["token"] = u["token"]
     return out
+
+
+def event_out(e):
+    return {"id": e["id"], "level": e["level"], "kind": e["kind"], "title": e["title"], "message": e.get("message") or "",
+            "created_at": ts(e.get("created_at")), "ack": e.get("ack"), "ack_by": e.get("ack_by"),
+            "ack_at": ts(e.get("ack_at")), "telegram": bool(e.get("telegram_msg_id")), "data": _loads(e.get("data"), None)}
 
 
 def _body():
@@ -362,6 +369,10 @@ def create_app(start_scheduler=False):
             "backups": [backup_out(b) for b in database.list_backups(uid, 5)],
             "next_schedule": schedule_out(nxt) if nxt else None,
             "disk": disk, "server_time": database.now_iso(),
+            # tuan 4 (B): RPO xanh/vang/do, may, snapshot, ti le khu trung lap, kho; tuan 6: su kien
+            "v2": monitor.overview_v2(uid),
+            "events": [event_out(e) for e in database.list_events(uid, 6)],
+            "alerts_open": database.count_open_alerts(uid),
         })
 
     # ---------------------------------------------------------------- backup / restore
@@ -414,6 +425,52 @@ def create_app(start_scheduler=False):
             raise ApiError(404, "Không tìm thấy tác vụ", "not_found")
         return jsonify({"job": job_out(database.cancel_job(job_id))})
 
+    # ---------------------------------------------------------------- su kien / thong bao (tuan 4-6)
+    @app.get("/api/ui/events")
+    @ui_auth()
+    def ui_events():
+        limit = min(max(int(request.args.get("limit", 50)), 1), 500)
+        return jsonify({"events": [event_out(e) for e in database.list_events(g.user["id"], limit,
+                                                                              request.args.get("open") == "1")],
+                        "alerts_open": database.count_open_alerts(g.user["id"])})
+
+    @app.post("/api/ui/events/<int:eid>/ack")
+    @ui_auth()
+    def ui_event_ack(eid):
+        e = database.get_event(eid)
+        if not e or (e["user_id"] not in (None, g.user["id"]) and g.user["role"] != "admin"):
+            raise ApiError(404, "Không tìm thấy sự kiện", "not_found")
+        verdict = _body().get("verdict")
+        if verdict not in database.ACK_VALUES:
+            raise ApiError(400, "Chọn 'binh_thuong' hoặc 'su_co'", "bad_verdict")
+        ev = database.ack_event(eid, verdict, g.user["username"])
+        notify.after_web_ack(ev)                  # bo nut tren tin Telegram tuong ung (neu da gui)
+        return jsonify({"event": event_out(ev)})
+
+    # ---------------------------------------------------------------- kho v2 (tuan 4): trang thai + viec cho agent
+    @app.get("/api/ui/kho")
+    @ui_auth()
+    def ui_kho():
+        return jsonify({"kho": monitor.kho_stats(force=request.args.get("refresh") == "1"),
+                        "dedup": monitor.dedup(database.list_backups(g.user["id"], 300)), "rpo_hours": config.RPO_HOURS})
+
+    def _v2_job(job_type, params):
+        _reject_duplicate(g.user["id"], job_type, params)
+        jid = database.create_job(g.user["id"], job_type, params)
+        return jsonify({"job": job_out(database.get_job(jid))}), 201
+
+    @app.post("/api/ui/kho/verify")
+    @ui_auth()
+    def ui_kho_verify():
+        d = request.get_json(silent=True) or {}
+        return _v2_job("verify", {"sample": max(1, min(int(d.get("sample") or 20), 500))})
+
+    @app.post("/api/ui/kho/check")
+    @ui_auth()
+    def ui_kho_check():
+        d = request.get_json(silent=True) or {}
+        return _v2_job("check", {"full": bool(d.get("full"))})
+
     # ---------------------------------------------------------------- lich
     def _own_schedule(sid):
         s = scheduler.get_schedule(sid)
@@ -441,9 +498,11 @@ def create_app(start_scheduler=False):
         if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", tod):
             raise ApiError(400, "Giờ chạy phải dạng HH:MM", "bad_time")
         dow = int(d.get("day_of_week") or 0) % 7
-        comps = _components(d.get("components") or config.BACKUP_COMPONENTS)
+        jt = d.get("job_type") if d.get("job_type") in scheduler.JOB_TYPES else "backup"
+        comps = _components(d.get("components") or config.BACKUP_COMPONENTS) if jt == "backup" else []
         paths = _paths(d.get("paths")) if "files" in comps else None
-        sid = scheduler.create_schedule(g.user["id"], name, stype, max(1, min(hours, 720)), tod, dow, paths, comps)
+        sid = scheduler.create_schedule(g.user["id"], name, stype, max(1, min(hours, 720)), tod, dow, paths, comps,
+                                        job_type=jt)
         return jsonify({"schedule": schedule_out(scheduler.get_schedule(sid))}), 201
 
     @app.post("/api/ui/schedules/<int:sid>/toggle")
@@ -457,7 +516,7 @@ def create_app(start_scheduler=False):
     @ui_auth()
     def ui_schedule_run(sid):
         s = _own_schedule(sid)
-        jid = database.create_job(s["user_id"], "backup", scheduler.job_params(s))
+        jid = database.create_job(s["user_id"], s.get("job_type") or "backup", scheduler.job_params(s))
         return jsonify({"job": job_out(database.get_job(jid))}), 201
 
     @app.delete("/api/ui/schedules/<int:sid>")
@@ -559,6 +618,52 @@ def create_app(start_scheduler=False):
         database.delete_user(uid)       # file backup trong kho KHONG bi xoa
         return jsonify({"ok": True})
 
+    # ---------------------------------------------------------------- Telegram (tuan 6, B) - chi admin
+    def _telegram_state():
+        s = notify.settings()
+        tok = s["token"]
+        return {"configured": bool(tok and s["chat_id"]), "has_token": bool(tok),
+                "token_masked": f"{tok[:6]}…{tok[-4:]}" if len(tok) > 12 else ("•" * len(tok)),
+                "chat_id": s["chat_id"], "enabled": s["enabled"], "notify_ok": s["notify_ok"],
+                "from_env": bool(config.TELEGRAM_TOKEN) and not database.get_setting("telegram_token")}
+
+    @app.get("/api/ui/settings/telegram")
+    @ui_auth(admin=True)
+    def ui_telegram_get():
+        return jsonify(_telegram_state())
+
+    @app.post("/api/ui/settings/telegram")
+    @ui_auth(admin=True)
+    def ui_telegram_set():
+        d = _body()
+        if "token" in d:
+            tok = str(d.get("token") or "").strip()
+            if tok and not re.fullmatch(r"\d{6,12}:[A-Za-z0-9_-]{30,}", tok):
+                raise ApiError(400, "Token không đúng dạng 123456789:ABC… (lấy từ @BotFather)", "bad_token")
+            database.set_setting("telegram_token", tok or None)
+        if "chat_id" in d:
+            cid = str(d.get("chat_id") or "").strip()
+            if cid and not re.fullmatch(r"-?\d{1,20}", cid):
+                raise ApiError(400, "Chat ID là một số (nhắn /id cho bot để lấy)", "bad_chat_id")
+            database.set_setting("telegram_chat_id", cid or None)
+        for k in ("enabled", "notify_ok"):
+            if k in d:
+                database.set_setting(f"telegram_{k}", "1" if d[k] else "0")
+        return jsonify(_telegram_state())
+
+    @app.post("/api/ui/settings/telegram/test")
+    @ui_auth(admin=True)
+    def ui_telegram_test():
+        s = notify.settings()
+        if not (s["token"] and s["chat_id"]):
+            raise ApiError(400, "Chưa có token hoặc chat ID", "not_configured")
+        ev = database.add_event("test", "Tin thử từ Backup System",
+                                f"Gửi bởi {g.user['username']} từ trang Cài đặt. Bấm một nút bên dưới để thử xác nhận.",
+                                "info", g.user["id"])
+        if not notify.send_event(ev, buttons=True, force=True):
+            raise ApiError(502, f"Không gửi được: {notify.last_error()}", "telegram_failed")
+        return jsonify({"ok": True, "event": event_out(database.get_event(ev["id"]))})
+
     # ---------------------------------------------------------------- duyet thu muc may agent
     def _agent_browser(path, params=None):
         agents = [a for a in database.list_agents(g.user["id"]) if a.get("browser_port")]
@@ -628,8 +733,16 @@ def create_app(start_scheduler=False):
             upd["completed_at"] = database.now_iso()
         if upd:
             database.update_job(job_id, **upd)
+            if upd.get("status") in TERMINAL:         # tuan 6: su kien + Telegram khi job ket thuc
+                notify.job_finished(database.get_job(job_id), host=request.headers.get("X-Agent-Host"),
+                                    user_id=g.agent_user["id"])
         _touch_agent(None if upd.get("status") in TERMINAL else job_id)
         return jsonify({"ok": True, "cancel": bool(j.get("cancel_requested"))})
+
+    def _after_backup(uid):
+        """Sao luu xong: doc lai so lieu kho ngay va tinh lai RPO (doi mau -> su kien) khong cho chu ky 5 phut."""
+        monitor.invalidate_kho()
+        threading.Thread(target=monitor.check_user_id, args=(uid, notify.notify), daemon=True, name="rpo-now").start()
 
     @app.post("/api/jobs/<int:job_id>/backup_done")
     @agent_auth
@@ -648,9 +761,11 @@ def create_app(start_scheduler=False):
             bid = database.create_backup_record(g.agent_user["id"], filename, d.get("paths") or [],
                                                 "full" if set(comps) >= set(config.BACKUP_COMPONENTS) else "selected")
             database.update_backup(bid, size=int(d.get("size") or 0), status="completed",
+                                   host=(request.headers.get("X-Agent-Host") or "")[:100] or None,
                                    snapshot_summary=json.dumps(ss, ensure_ascii=False),
                                    stats=json.dumps(dict(d.get("stats") or {}, engine="v2"), ensure_ascii=False))
             database.update_job(job_id, backup_id=bid)
+            _after_backup(g.agent_user["id"])
             return jsonify({"ok": True, "backup_id": bid})
         if not FILENAME_RE.match(filename):
             raise ApiError(400, "Tên file không hợp lệ", "bad_filename")
@@ -664,10 +779,26 @@ def create_app(start_scheduler=False):
         bid = database.create_backup_record(g.agent_user["id"], filename, d.get("paths") or [],
                                             "full" if is_full else "selected")
         database.update_backup(bid, size=os.path.getsize(path), status="completed",
+                               host=(request.headers.get("X-Agent-Host") or "")[:100] or None,
                                snapshot_summary=json.dumps(ss, ensure_ascii=False),
                                stats=json.dumps(d.get("stats") or {}, ensure_ascii=False))
         database.update_job(job_id, backup_id=bid)
+        _after_backup(g.agent_user["id"])
         return jsonify({"ok": True, "backup_id": bid})
+
+    # ---------------------------------------------------------------- webhook thong bao (tuan 6)
+    # python -m core verify|backup --notify-url http://127.0.0.1:5000/api/notify?token=<AGENT_TOKEN>
+    # verify_sql_restore.ps1 -NotifyUrl ...   -> ghi su kien + Telegram
+    @app.post("/api/notify")
+    def api_notify():
+        user = database.get_user_by_token(request.headers.get("X-Auth-Token") or request.args.get("token", ""))
+        if not user:
+            raise ApiError(401, "Token không hợp lệ", "unauthorized")
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            raise ApiError(400, "Cần JSON", "bad_json")
+        ev = notify.from_webhook(payload, user_id=user["id"])
+        return jsonify({"ok": True, "event_id": ev["id"]})
 
     # ---------------------------------------------------------------- kho (chi them, khong xoa)
     @app.put("/api/storage/backups/<filename>")
@@ -738,6 +869,8 @@ def create_app(start_scheduler=False):
 
     if start_scheduler:
         scheduler.start_scheduler()
+        notify.start_poller()                              # nhan nut Binh thuong / Su co tu Telegram
+        monitor.start_rpo_monitor(notify.notify)           # RPO doi mau -> su kien + Telegram
     return app
 
 

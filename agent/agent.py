@@ -146,14 +146,50 @@ def handle_restore(api, job):
     return msg
 
 
+def _need_v2():
+    if config.ENGINE != "v2":
+        raise RuntimeError("Việc này cần ENGINE=v2 (kho v2) trong agent_config.txt")
+    return v2_engine()
+
+
+def handle_verify(api, job):
+    """Tuan 6: khoi phuc thu vai file ngau nhien tu snapshot moi nhat, so SHA-256. Loi -> job that bai -> Telegram."""
+    params = job.get("params") or {}
+    rep = Reporter(api, job["id"])
+    eng = _need_v2()
+    rep(5, "Đang khôi phục thử vài file ngẫu nhiên từ snapshot mới nhất…", force=True)
+    r = eng.verify(sample=int(params.get("sample") or 20))
+    msg = (f"Khôi phục thử snapshot {r['snapshot'][:12]} ({str(r['snapshot_time'])[:16]}): "
+           f"{vn_int(r['ok'])}/{vn_int(r['checked'])} file khớp SHA-256, {vn_mb(r['bytes'])}, {vn_num(r['seconds'])} giây")
+    if r["result"] != "OK":
+        raise RuntimeError(msg + "; LỖI: " + "; ".join(f"{f['path']}: {f['error']}" for f in r["failed"][:3]))
+    return msg
+
+
+def handle_check(api, job):
+    params = job.get("params") or {}
+    rep = Reporter(api, job["id"])
+    eng = _need_v2()
+    full = bool(params.get("full"))
+    rep(5, "Đang kiểm tra toàn vẹn kho " + ("(đầy đủ: giải mã từng mẩu)…" if full else "(nhanh: SHA-256 + cấu trúc)…"), force=True)
+    r = eng.check(full=full, progress=lambda n, t, m: rep(5 + int(90 * n / t) if t else 50, m))
+    msg = f"Kiểm tra kho {'đầy đủ' if full else 'nhanh'}: {r['packs']} pack, {vn_int(r['chunks'])} mẩu, {r['snapshots']} snapshot"
+    if r["errors"]:
+        raise RuntimeError(f"KHO CÓ LỖI ({len(r['errors'])}): " + "; ".join(r["errors"][:3]))
+    return msg + " - toàn vẹn"
+
+
+HANDLERS = {"backup": handle_backup, "restore": handle_restore, "verify": handle_verify, "check": handle_check}
+
+
 def run_job(api, job):
     jid, jtype = job["id"], job.get("job_type")
     log.info("Nhận job #%s (%s)", jid, jtype)
     try:
-        msg = (handle_backup if jtype == "backup" else handle_restore)(api, job) \
-            if jtype in ("backup", "restore") else None
-        if msg is None:
+        handler = HANDLERS.get(jtype)
+        if handler is None:
             raise ValueError(f"Loại job không hỗ trợ: {jtype}")
+        msg = handler(api, job)
         api.update(jid, status="completed", progress=100, message=msg, completed=True)
         log.info("Job #%s xong: %s", jid, msg)
     except JobCancelled:

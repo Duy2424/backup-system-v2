@@ -16,6 +16,7 @@ from shared import database
 
 log = logging.getLogger("server.scheduler")
 TYPES = ("hourly", "daily", "weekly")
+JOB_TYPES = ("backup", "verify")        # verify = khoi phuc thu hang tuan (tuan 6): agent khoi phuc vai file, so SHA-256
 
 
 def _parse_hhmm(value):
@@ -43,16 +44,18 @@ def compute_next_run(schedule_type, interval_hours, time_of_day, day_of_week, fr
 
 
 def create_schedule(user_id, name, schedule_type, interval_hours, time_of_day, day_of_week,
-                    backup_paths, components=None):
+                    backup_paths, components=None, job_type="backup"):
+    if job_type not in JOB_TYPES:
+        raise ValueError(f"job_type khong hop le: {job_type}")
     nxt = compute_next_run(schedule_type, interval_hours, time_of_day, day_of_week).isoformat(timespec="seconds")
     with database.get_db() as conn:
         cur = conn.execute(
             """INSERT INTO schedules (user_id, name, schedule_type, interval_hours, time_of_day, day_of_week,
-                                      backup_paths, components, enabled, next_run, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+                                      backup_paths, components, enabled, next_run, created_at, job_type)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)""",
             (user_id, name, schedule_type, interval_hours, time_of_day, day_of_week,
              json.dumps(backup_paths, ensure_ascii=False) if backup_paths else None,
-             json.dumps(components) if components else None, nxt, database.now_iso()))
+             json.dumps(components) if components else None, nxt, database.now_iso(), job_type))
         return cur.lastrowid
 
 
@@ -97,6 +100,8 @@ def job_params(s):
             return json.loads(v) if v else None
         except ValueError:
             return None
+    if (s.get("job_type") or "backup") == "verify":
+        return {"sample": 20, "schedule_id": s["id"]}
     return {"paths": _load(s.get("backup_paths")), "components": _load(s.get("components")),
             "schedule_id": s["id"]}
 
@@ -125,9 +130,10 @@ def check_due(now=None):
         if active and json.loads(active.get("params") or "{}").get("schedule_id") == s["id"]:
             log.info("Lịch '%s' đến hạn nhưng lần trước chưa xong - bỏ qua lần này", s["name"])
         else:
-            database.create_job(s["user_id"], "backup", params=job_params(s))
+            jt = s.get("job_type") or "backup"
+            database.create_job(s["user_id"], jt, params=job_params(s))
             created += 1
-            log.info("Tạo job sao lưu theo lịch '%s' (user %s)", s["name"], s["user_id"])
+            log.info("Tạo job %s theo lịch '%s' (user %s)", jt, s["name"], s["user_id"])
         _mark_run(s, now)
     return created
 

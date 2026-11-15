@@ -422,3 +422,38 @@ pre.snippet { margin: var(--sp-3) 0 0; padding: var(--sp-3) var(--sp-4); backgro
   *, *::before, *::after { animation-duration: 1ms !important; animation-iteration-count: 1 !important; transition-duration: 1ms !important; }
   .bar.indeterminate > i { animation: none; width: 100% !important; opacity: 0.4; }
 }
+
+/* ------------------------------------------------------------------ v2 (tuan 4-6): RPO, may, su kien */
+/* RPO: den tron + CHU (khong truyen trang thai chi bang mau), du to de doc tu cuoi phong */
+.rpo { display: inline-flex; align-items: center; gap: 8px; padding: 3px 12px 3px 9px; border-radius: 999px;
+       font-weight: 700; font-size: var(--fs-sm); white-space: nowrap; background: var(--idle-bg); color: var(--idle); }
+.rpo::before { content: ""; width: 10px; height: 10px; border-radius: 50%; background: currentColor; flex: none; }
+.rpo.xanh { background: var(--ok-bg); color: var(--ok); }
+.rpo.vang { background: var(--warn-bg); color: var(--warn); }
+.rpo.do { background: var(--err-bg); color: var(--err); }
+.rpo.lg { font-size: var(--fs-md); padding: 5px 14px 5px 11px; }
+.rpo.lg::before { width: 12px; height: 12px; }
+.status-cell.rpo-cell .status-value { flex-wrap: wrap; }
+
+.event { display: flex; align-items: flex-start; gap: var(--sp-3); padding: var(--sp-3) var(--sp-5); min-width: 0; }
+.event + .event { border-top: 1px solid var(--line); }
+.event .grow { flex: 1; min-width: 0; }
+.event .t { font-weight: 600; }
+.event .m { font-size: var(--fs-sm); color: var(--ink-2); margin-top: 2px; white-space: pre-wrap; word-break: break-word; }
+.event .meta { font-size: var(--fs-xs); color: var(--ink-3); margin-top: 4px; }
+.event-right { flex: none; display: flex; align-items: center; gap: var(--sp-2); }
+.ack-row { display: flex; gap: var(--sp-2); }
+.lvl { width: 10px; height: 10px; border-radius: 50%; background: var(--idle); flex: none; margin-top: 7px; }
+.lvl.ok { background: var(--ok); }
+.lvl.warn { background: var(--warn); }
+.lvl.err { background: var(--err); }
+.lvl.info { background: var(--info); }
+
+.badge-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--err); flex: none; box-shadow: 0 0 0 2px var(--surface-2); }
+
+@media (max-width: 960px) {
+  .nav a { position: relative; }
+  .nav a .badge-dot { position: absolute; top: 6px; right: 6px; margin: 0; }
+  .event { flex-wrap: wrap; }
+  .event-right { width: 100%; justify-content: flex-end; }
+}

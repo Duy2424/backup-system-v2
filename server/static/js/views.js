@@ -5,17 +5,18 @@ import {
   statusPill, store, toast,
 } from "./lib.js";
 import { pickFolder } from "./picker.js";
+import { renderSettingsExtras } from "./views_v2.js";
 
 const PRESET_KEY = "bks-last-backup";
 const NET = ALL_COMPONENTS.filter((c) => COMPONENTS[c].group !== "data");
 
-function pageHead(title, lead, ...actions) {
+export function pageHead(title, lead, ...actions) {
   return h("header", { class: "page-head" },
     h("div", {}, h("h1", { text: title }), lead ? h("p", { class: "lead", text: lead }) : null),
     actions.length ? h("div", { class: "page-actions" }, actions) : null);
 }
 
-function compSummary(comps) {
+export function compSummary(comps) {
   if (!comps || !comps.length) return h("span", { class: "subtle" }, "–");
   if (ALL_COMPONENTS.every((c) => comps.includes(c))) return h("span", { class: "chip" }, "Toàn bộ");
   const shown = comps.slice(0, 3).map((c) => h("span", { class: "chip", text: compLabel(c) }));
@@ -23,12 +24,12 @@ function compSummary(comps) {
   return h("span", { class: "chips" }, shown);
 }
 
-function agentOnline(ov) {
+export function agentOnline(ov) {
   const a = (ov && ov.agents) || [];
   return a.find((x) => x.online) || null;
 }
 
-async function startBackup(ctx, preset, btn) {
+export async function startBackup(ctx, preset, btn) {
   if (btn && btn.disabled) return null;     // dang gui -> bo qua lan bam them
   if (btn) busy(btn, true, "Đang gửi…");
   try {
@@ -523,6 +524,11 @@ export function schedulesView(ctx) {
     const paths = [];
     const checks = componentChecks(selected, () => sync(), { compact: true });
     const name = h("input", { class: "input", required: true, maxlength: "80", placeholder: "vd Sao lưu hằng đêm" });
+    // tuan 6: lich co the la "khoi phuc thu" (agent khoi phuc vai file ngau nhien, so SHA-256, bao ket qua)
+    const jobKind = h("div", { class: "segmented", role: "radiogroup", "aria-label": "Việc" },
+      [["backup", "Sao lưu"], ["verify", "Khôi phục thử"]].map(([v, l]) => h("label", {},
+        h("input", { type: "radio", name: "jkind", value: v, checked: v === "backup", onchange: () => sync() }), h("span", { text: l }))));
+    function jkind() { return jobKind.querySelector("input:checked").value; }
     const type = h("div", { class: "segmented", role: "radiogroup", "aria-label": "Tần suất" },
       [["daily", "Hằng ngày"], ["weekly", "Hằng tuần"], ["hourly", "Mỗi N giờ"]].map(([v, l]) => h("label", {},
         h("input", { type: "radio", name: "stype", value: v, checked: v === "daily", onchange: () => sync() }), h("span", { text: l }))));
@@ -543,8 +549,12 @@ export function schedulesView(ctx) {
       fDow.hidden = stype() !== "weekly";
       fHours.hidden = stype() !== "hourly";
       filesBox.replaceChildren(selected.has("files") ? folderEditor(paths, () => {}, ctx.state.session.default_paths) : "");
-      submit.disabled = selected.size === 0;
+      compsField.hidden = jkind() === "verify";
+      submit.disabled = jkind() === "backup" && selected.size === 0;
     }
+
+    const compsField = h("fieldset", { style: { marginTop: "20px" } }, h("legend", {}, "Thành phần"),
+      h("div", { class: "check-grid" }, ALL_COMPONENTS.map((c) => checks.make(c))), filesBox);
 
     const form = h("form", { class: "panel", style: { marginBottom: "20px" }, onsubmit: async (e) => {
       e.preventDefault();
@@ -552,7 +562,7 @@ export function schedulesView(ctx) {
       busy(submit, true, "Đang lưu…");
       try {
         await api("/api/ui/schedules", { method: "POST", body: {
-          name: name.value.trim(), schedule_type: stype(), time_of_day: time.value, day_of_week: Number(dow.value),
+          name: name.value.trim(), job_type: jkind(), schedule_type: stype(), time_of_day: time.value, day_of_week: Number(dow.value),
           interval_hours: Number(hours.value), components: ALL_COMPONENTS.filter((c) => selected.has(c)),
           paths: selected.has("files") ? paths : [] } });
         toast("Đã thêm lịch");
@@ -565,10 +575,10 @@ export function schedulesView(ctx) {
       h("div", { class: "panel-head" }, h("h2", { text: "Lịch mới" })),
       h("div", { class: "panel-body" },
         h("div", { class: "form-grid" }, field("Tên lịch", name),
+          h("div", { class: "field" }, h("span", { class: "label" }, "Việc"), jobKind),
           h("div", { class: "field" }, h("span", { class: "label" }, "Tần suất"), type)),
         h("div", { class: "form-grid", style: { marginTop: "16px" } }, fTime, fDow, fHours),
-        h("fieldset", { style: { marginTop: "20px" } }, h("legend", {}, "Thành phần"),
-          h("div", { class: "check-grid" }, ALL_COMPONENTS.map((c) => checks.make(c))), filesBox),
+        compsField,
         err,
         h("div", { class: "btn-row" }, submit, cancel)));
     sync();
@@ -604,7 +614,7 @@ export function schedulesView(ctx) {
         });
         return h("tr", {},
           h("td", {}, sw), h("td", { class: "nowrap" }, h("strong", { text: s.name })), h("td", { class: "nowrap" }, freqText(s)),
-          h("td", {}, compSummary(s.components)),
+          h("td", {}, s.job_type === "verify" ? h("span", { class: "chip", text: "Khôi phục thử · so SHA-256" }) : compSummary(s.components)),
           h("td", { class: "tnum nowrap" }, s.enabled ? fmtRelative(s.next_run) : h("span", { class: "subtle" }, "Đang tắt")),
           h("td", { class: "tnum nowrap subtle" }, s.last_run ? fmtRelative(s.last_run) : "Chưa chạy"),
           h("td", { class: "actions" }, run, " ", del));
@@ -734,6 +744,7 @@ export function settingsView(ctx) {
       h("div", { class: "panel-body" }, theme, h("p", { class: "subtle", style: { marginTop: "8px" },
         text: "Nền sáng dễ đọc hơn khi chiếu lên máy chiếu." }))),
     h("section", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: "Máy chủ" })), sysBody));
+  renderSettingsExtras(ctx, el);            // tuan 4-6: Kho v2 + Telegram (views_v2.js)
 
   async function loadAgent() {
     try {

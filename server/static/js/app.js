@@ -1,6 +1,7 @@
 // Khung ung dung: dang nhap, dieu huong (#/...), poll trang thai, thanh tien do toan cuc.
 import { api, ApiError, busy, field, fmtRelative, h, icon, jobTitle, setCsrf, statusPill, toast } from "./lib.js";
-import { backupView, backupsView, jobsView, overviewView, schedulesView, settingsView, usersView } from "./views.js";
+import { backupView, backupsView, jobsView, schedulesView, settingsView, usersView } from "./views.js";
+import { eventsView, overviewView } from "./views_v2.js";
 
 const root = document.getElementById("app");
 const bus = new EventTarget();
@@ -11,6 +12,7 @@ const ROUTES = [
   { path: "sao-luu", title: "Sao lưu", icon: "upload", view: backupView },
   { path: "ban-sao-luu", title: "Bản sao lưu", icon: "archive", view: backupsView },
   { path: "tac-vu", title: "Tác vụ", icon: "list", view: jobsView },
+  { path: "thong-bao", title: "Thông báo", icon: "bell", view: eventsView },
   { path: "lich", title: "Lịch", icon: "clock", view: schedulesView },
   { path: "nguoi-dung", title: "Người dùng", icon: "users", view: usersView, admin: true },
   { path: "cai-dat", title: "Cài đặt", icon: "sliders", view: settingsView },
@@ -112,7 +114,8 @@ function renderShell() {
   const s = state.session;
   nav = h("nav", { class: "nav", "aria-label": "Điều hướng chính" },
     ROUTES.filter((r) => !r.admin || s.user.role === "admin").map((r) =>
-      h("a", { href: `#/${r.path}`, dataset: { path: r.path }, title: r.title }, icon(r.icon), h("span", { text: r.title }))));
+      h("a", { href: `#/${r.path}`, dataset: { path: r.path }, title: r.title }, icon(r.icon), h("span", { text: r.title }),
+        r.path === "thong-bao" ? h("span", { class: "badge-dot", hidden: true, "aria-label": "Có cảnh báo chưa xác nhận" }) : null)));
   agentMini = h("a", { class: "agent-mini", href: "#/cai-dat", title: "Trạng thái agent" });
   const logout = h("button", { class: "btn btn-ghost btn-sm btn-icon", type: "button", "aria-label": "Đăng xuất", title: "Đăng xuất" }, icon("logout"));
   logout.addEventListener("click", async () => {
@@ -140,6 +143,8 @@ function renderChrome() {
   const ag = ov && (ov.agents || []).find((a) => a.online);
   agentMini.replaceChildren(h("span", { class: `dot ${ag ? "ok" : ov ? "err" : ""}` }),
     h("span", { class: "truncate", text: !ov ? "Đang kiểm tra…" : ag ? `Agent: ${ag.hostname}` : "Agent chưa kết nối" }));
+  const badge = nav && nav.querySelector('a[data-path="thong-bao"] .badge-dot');
+  if (badge) badge.hidden = !(ov && ov.alerts_open > 0);
   // thanh tien do o moi trang tru Tong quan (o do da co khung lon)
   const j = ov && ov.active_job;
   const onOverview = currentPath() === "";

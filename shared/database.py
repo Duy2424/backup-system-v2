@@ -17,7 +17,7 @@ from datetime import datetime
 
 from shared import config
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _SCRYPT = {"n": 2 ** 14, "r": 8, "p": 1}
 
 
@@ -156,6 +156,26 @@ def init_db(admin_password=None):
         );
         CREATE INDEX IF NOT EXISTS idx_jobs_user_status ON jobs(user_id, status);
         CREATE INDEX IF NOT EXISTS idx_backups_user ON backups(user_id, created_at);
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            level TEXT NOT NULL DEFAULT 'info',
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            message TEXT,
+            data TEXT,
+            created_at TIMESTAMP,
+            ack TEXT,
+            ack_by TEXT,
+            ack_at TIMESTAMP,
+            telegram_msg_id INTEGER,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
         """)
         # --- migration tu CSDL v1 ---
         if "cancel_requested" not in _columns(conn, "jobs"):
@@ -166,6 +186,11 @@ def init_db(admin_password=None):
             conn.execute("ALTER TABLE backups ADD COLUMN stats TEXT")
         if "components" not in _columns(conn, "schedules"):
             conn.execute("ALTER TABLE schedules ADD COLUMN components TEXT")
+        # --- v3 (tuan 4-6): may tao ban sao luu; lich co the la 'verify' (khoi phuc thu hang tuan) ---
+        if "host" not in _columns(conn, "backups"):
+            conn.execute("ALTER TABLE backups ADD COLUMN host TEXT")
+        if "job_type" not in _columns(conn, "schedules"):
+            conn.execute("ALTER TABLE schedules ADD COLUMN job_type TEXT DEFAULT 'backup'")
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
         created_pw = None
@@ -268,7 +293,7 @@ def count_admins():
 
 # ===================================================================== backups
 
-_BACKUP_COLS = {"size", "snapshot_summary", "status", "stats", "filename", "paths", "backup_type"}
+_BACKUP_COLS = {"size", "snapshot_summary", "status", "stats", "filename", "paths", "backup_type", "host"}
 
 
 def create_backup_record(user_id, filename, paths, backup_type="full"):
@@ -407,3 +432,84 @@ def list_agents(user_id):
     with get_db() as conn:
         return [dict(r) for r in conn.execute(
             "SELECT * FROM agents WHERE user_id=? ORDER BY last_seen DESC", (user_id,))]
+
+
+# ===================================================================== su kien / thong bao (tuan 4-6)
+
+EVENT_LEVELS = ("info", "ok", "warn", "err")
+ACK_VALUES = ("binh_thuong", "su_co")
+
+
+def add_event(kind, title, message="", level="info", user_id=None, data=None):
+    """Ghi mot su kien (sao luu xong, that bai, bat thuong, RPO doi mau, khoi phuc thu...). user_id None = ca he thong."""
+    if level not in EVENT_LEVELS:
+        raise ValueError(f"level khong hop le: {level}")
+    with get_db() as conn:
+        cur = conn.execute(
+            "INSERT INTO events (user_id, level, kind, title, message, data, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, level, kind, str(title)[:200], str(message or "")[:2000],
+             json.dumps(data, ensure_ascii=False) if data is not None else None, now_iso()))
+        return _one(conn, "SELECT * FROM events WHERE id=?", (cur.lastrowid,))
+
+
+def get_event(event_id):
+    with get_db() as conn:
+        return _one(conn, "SELECT * FROM events WHERE id=?", (event_id,))
+
+
+def list_events(user_id=None, limit=50, only_open=False):
+    """Su kien cua user + su kien toan he thong (user_id NULL). only_open: chi canh bao chua xac nhan."""
+    sql = "SELECT * FROM events WHERE (user_id IS NULL OR user_id=?)"
+    if only_open:
+        sql += " AND level IN ('warn','err') AND ack IS NULL"
+    sql += " ORDER BY id DESC LIMIT ?"
+    with get_db() as conn:
+        return [dict(r) for r in conn.execute(sql, (user_id, limit))]
+
+
+def count_open_alerts(user_id=None):
+    with get_db() as conn:
+        return conn.execute("SELECT COUNT(*) FROM events WHERE (user_id IS NULL OR user_id=?) "
+                            "AND level IN ('warn','err') AND ack IS NULL", (user_id,)).fetchone()[0]
+
+
+def ack_event(event_id, verdict, by):
+    """Quan tri bam 'Binh thuong' / 'Su co' (tren web hoac nut Telegram)."""
+    if verdict not in ACK_VALUES:
+        raise ValueError(f"verdict khong hop le: {verdict}")
+    with get_db() as conn:
+        conn.execute("UPDATE events SET ack=?, ack_by=?, ack_at=? WHERE id=?", (verdict, str(by)[:80], now_iso(), event_id))
+        return _one(conn, "SELECT * FROM events WHERE id=?", (event_id,))
+
+
+def auto_ack_rpo(user_id):
+    """RPO tro lai xanh -> cac canh bao RPO chua xac nhan cua user duoc dong tu dong (ghi ro la tu he thong)."""
+    with get_db() as conn:
+        conn.execute("UPDATE events SET ack='binh_thuong', ack_by='tự hết (RPO xanh)', ack_at=? "
+                     "WHERE kind='rpo' AND ack IS NULL AND level IN ('warn','err') AND (user_id=? OR user_id IS NULL)",
+                     (now_iso(), user_id))
+
+
+def set_event_telegram(event_id, message_id):
+    with get_db() as conn:
+        conn.execute("UPDATE events SET telegram_msg_id=? WHERE id=?", (message_id, event_id))
+
+
+def get_setting(key, default=None):
+    with get_db() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+
+
+def set_setting(key, value):
+    with get_db() as conn:
+        if value is None:
+            conn.execute("DELETE FROM settings WHERE key=?", (key,))
+        else:
+            conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                         (key, str(value)))
+
+
+def all_settings(prefix=""):
+    with get_db() as conn:
+        return {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings WHERE key LIKE ?", (prefix + "%",))}
