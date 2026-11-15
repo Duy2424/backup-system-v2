@@ -1,0 +1,31 @@
+# Vi du cau hinh rclone cho ban sao kho len cloud (Nguoi B, tuan 5).
+# Chep thanh %APPDATA%\rclone\rclone.conf (hoac dung -RcloneConfig <file>). KHONG dua file that co key len git.
+#
+# Backblaze B2: tao bucket PRIVATE, bat "Object Lock" khi tao bucket, dat Default Retention = 30 ngay (Compliance).
+# Application Key: chi cho bucket nay, capabilities listBuckets, listFiles, readFiles, writeFiles (KHONG deleteFiles).
+[b2kho]
+type = b2
+account = <keyID>
+key = <applicationKey>
+hard_delete = false
+
+# AWS S3: bucket bat Versioning + Object Lock, Default retention mode COMPLIANCE 30 ngay.
+[s3kho]
+type = s3
+provider = AWS
+env_auth = false
+access_key_id = <AKIA...>
+secret_access_key = <...>
+region = ap-southeast-1
+
+# MinIO chay tren chinh PC (demo khi chua co the quoc te):
+#   minio.exe server D:\minio --console-address :9001
+#   mc alias set local http://127.0.0.1:9000 minioadmin minioadmin
+#   mc mb --with-lock local/kho
+#   mc retention set --default COMPLIANCE 30d local/kho
+[miniokho]
+type = s3
+provider = Minio
+access_key_id = minioadmin
+secret_access_key = minioadmin
+endpoint = http://127.0.0.1:9000
